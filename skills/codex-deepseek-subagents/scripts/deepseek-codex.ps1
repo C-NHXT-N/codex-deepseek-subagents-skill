@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("install", "update", "uninstall", "doctor", "start-proxy", "stop-proxy", "test-proxy", "usage", "redact", "export-shareable")]
+    [ValidateSet("install", "update", "uninstall", "doctor", "desktop-doctor", "delegate", "start-proxy", "stop-proxy", "test-proxy", "usage", "redact", "export-shareable")]
     [string]$Command = "doctor",
 
     [string]$ProjectRoot = (Get-Location).Path,
@@ -16,6 +16,11 @@ param(
     [switch]$NoBackup,
     [switch]$Force,
     [switch]$RemoveSkill,
+    [ValidateSet("pro-thinking", "flash-thinking", "pro", "flash")]
+    [string]$Mode = "pro-thinking",
+    [string]$Prompt = "",
+    [string]$PromptFile = "",
+    [int]$MaxTokens = 2048,
     [string]$OutFile = ""
 )
 
@@ -141,6 +146,9 @@ function Add-GitIgnoreRules {
     $rules = @(
         ".codex/*.local.*",
         ".codex/deepseek-proxy.log.jsonl",
+        ".codex/deepseek-proxy.pid",
+        ".codex/deepseek-proxy.stdout.log",
+        ".codex/deepseek-proxy.stderr.log",
         ".codex/backups/"
     )
     $existing = if (Test-Path -LiteralPath $gitignore) { Get-Content -LiteralPath $gitignore } else { @() }
@@ -250,62 +258,153 @@ function Import-LocalEnv {
     . $envFile
 }
 
-function Test-DeepSeekDirect {
+function Get-DeepSeekModeSpec {
+    param([string]$SelectedMode)
+    switch ($SelectedMode) {
+        "pro-thinking" {
+            return [pscustomobject]@{
+                model = $env:DEEPSEEK_OPENAI_MODEL
+                thinking = @{ type = "enabled"; reasoning_effort = "high" }
+                model_label = "$env:DEEPSEEK_OPENAI_MODEL(thinking)"
+            }
+        }
+        "flash-thinking" {
+            return [pscustomobject]@{
+                model = $env:DEEPSEEK_OPENAI_FAST_MODEL
+                thinking = @{ type = "enabled"; reasoning_effort = "high" }
+                model_label = "$env:DEEPSEEK_OPENAI_FAST_MODEL(thinking)"
+            }
+        }
+        "pro" {
+            return [pscustomobject]@{
+                model = $env:DEEPSEEK_OPENAI_MODEL
+                thinking = @{ type = "disabled" }
+                model_label = $env:DEEPSEEK_OPENAI_MODEL
+            }
+        }
+        "flash" {
+            return [pscustomobject]@{
+                model = $env:DEEPSEEK_OPENAI_FAST_MODEL
+                thinking = @{ type = "disabled" }
+                model_label = $env:DEEPSEEK_OPENAI_FAST_MODEL
+            }
+        }
+    }
+}
+
+function Invoke-DeepSeekChat {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Messages,
+        [Parameter(Mandatory = $true)][string]$SelectedMode,
+        [int]$TokenLimit = 2048
+    )
     Import-LocalEnv
-    $headers = @{ Authorization = "Bearer $env:DEEPSEEK_API_KEY"; "Content-Type" = "application/json" }
+    $spec = Get-DeepSeekModeSpec -SelectedMode $SelectedMode
+    if (-not $env:DEEPSEEK_API_KEY) { throw "DEEPSEEK_API_KEY is not set." }
+    if (-not $env:DEEPSEEK_OPENAI_BASE_URL) { $env:DEEPSEEK_OPENAI_BASE_URL = "https://api.deepseek.com" }
+
+    Add-Type -AssemblyName System.Net.Http
     $body = @{
-        model = $env:DEEPSEEK_OPENAI_MODEL
-        messages = @(@{ role = "user"; content = "Reply with exactly: direct-ok" })
-        thinking = @{ type = "disabled" }
-        max_tokens = 32
+        model = $spec.model
+        messages = $Messages
+        thinking = $spec.thinking
+        max_tokens = $TokenLimit
         stream = $false
-    } | ConvertTo-Json -Depth 8
-    $response = Invoke-RestMethod -Method Post -Uri "$env:DEEPSEEK_OPENAI_BASE_URL/chat/completions" -Headers $headers -Body $body
+    } | ConvertTo-Json -Depth 20 -Compress
+
+    $client = [System.Net.Http.HttpClient]::new()
+    try {
+        $client.Timeout = [TimeSpan]::FromSeconds(300)
+        $client.DefaultRequestHeaders.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", $env:DEEPSEEK_API_KEY)
+        $content = [System.Net.Http.StringContent]::new($body, [System.Text.Encoding]::UTF8, "application/json")
+        $result = $client.PostAsync("$($env:DEEPSEEK_OPENAI_BASE_URL.TrimEnd('/'))/chat/completions", $content).GetAwaiter().GetResult()
+        $text = $result.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if (-not $result.IsSuccessStatusCode) {
+            throw "DeepSeek HTTP $([int]$result.StatusCode): $text"
+        }
+        $response = $text | ConvertFrom-Json
+        $message = $response.choices[0].message
+        $usage = $response.usage
+        $reasoningTokens = $null
+        if ($usage -and $usage.completion_tokens_details) {
+            $reasoningTokens = $usage.completion_tokens_details.reasoning_tokens
+        }
+        return [pscustomobject]@{
+            ok = $true
+            mode = $SelectedMode
+            model = $response.model
+            model_label = $spec.model_label
+            thinking_type = $spec.thinking.type
+            reasoning_effort = if ($spec.thinking.reasoning_effort) { $spec.thinking.reasoning_effort } else { $null }
+            finish_reason = $response.choices[0].finish_reason
+            content = $message.content
+            has_reasoning_content = [bool]$message.reasoning_content
+            reasoning_chars_discarded = if ($message.reasoning_content) { ([string]$message.reasoning_content).Length } else { 0 }
+            prompt_tokens = $usage.prompt_tokens
+            completion_tokens = $usage.completion_tokens
+            reasoning_tokens = $reasoningTokens
+            total_tokens = $usage.total_tokens
+        }
+    }
+    finally {
+        $client.Dispose()
+    }
+}
+
+function Test-DeepSeekDirect {
+    $response = Invoke-DeepSeekChat -SelectedMode "pro" -TokenLimit 32 -Messages @(@{ role = "user"; content = "Reply with exactly: direct-ok" })
     return [pscustomobject]@{
-        ok = ([string]$response.choices[0].message.content).Contains("direct-ok")
+        ok = ([string]$response.content).Contains("direct-ok")
         model = $response.model
-        total_tokens = $response.usage.total_tokens
+        model_label = $response.model_label
+        total_tokens = $response.total_tokens
     }
 }
 
 function Test-DeepSeekThinking {
-    Import-LocalEnv
-    $headers = @{ Authorization = "Bearer $env:DEEPSEEK_API_KEY"; "Content-Type" = "application/json" }
-    $body = @{
-        model = $env:DEEPSEEK_OPENAI_MODEL
-        messages = @(@{ role = "user"; content = "Which number is larger, 9.11 or 9.8? Reply with only the larger number." })
-        thinking = @{ type = "enabled"; reasoning_effort = "high" }
-        max_tokens = 1024
-        stream = $false
-    } | ConvertTo-Json -Depth 8
-    $response = Invoke-RestMethod -Method Post -Uri "$env:DEEPSEEK_OPENAI_BASE_URL/chat/completions" -Headers $headers -Body $body
+    $response = Invoke-DeepSeekChat -SelectedMode "pro-thinking" -TokenLimit 1024 -Messages @(@{ role = "user"; content = "Which number is larger, 9.11 or 9.8? Reply with only the larger number." })
     return [pscustomobject]@{
-        ok = [bool]$response.choices[0].message.reasoning_content
-        content = $response.choices[0].message.content
-        reasoning_tokens = $response.usage.completion_tokens_details.reasoning_tokens
-        total_tokens = $response.usage.total_tokens
+        ok = [bool]$response.has_reasoning_content
+        content = $response.content
+        model_label = $response.model_label
+        reasoning_tokens = $response.reasoning_tokens
+        total_tokens = $response.total_tokens
     }
 }
 
 function Start-Proxy {
     Import-LocalEnv
-    $shim = Get-ProjectPath ".codex/deepseek-responses-shim.ps1"
+    $shim = ".codex/deepseek_responses_shim.py"
     $pidFile = Get-ProjectPath ".codex/deepseek-proxy.pid"
     if (Test-Path -LiteralPath $pidFile) {
         $oldPid = Get-Content -Raw -LiteralPath $pidFile
         if ($oldPid -and (Get-Process -Id ([int]$oldPid) -ErrorAction SilentlyContinue)) {
-            Write-Step "Proxy already running with PID $oldPid"
-            return
+            try {
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2
+                if ($health.ok) {
+                    Write-Step "Proxy already running with PID $oldPid"
+                    return
+                }
+            }
+            catch {
+                Write-Step "Found stale proxy PID $oldPid without health response; restarting."
+                if (-not $DryRun) {
+                    Stop-Process -Id ([int]$oldPid) -Force -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+                }
+            }
         }
     }
     if ($DryRun) {
         Write-Step "Would start proxy: $shim on port $Port"
         return
     }
-    $shell = Get-Command pwsh -ErrorAction SilentlyContinue
-    if (-not $shell) { $shell = Get-Command powershell -ErrorAction SilentlyContinue }
-    if (-not $shell) { throw "Neither pwsh nor powershell was found." }
-    $process = Start-Process -FilePath $shell.Source -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $shim, "-Port", [string]$Port, "-LogPath", ".codex/deepseek-proxy.log.jsonl") -WorkingDirectory (Resolve-FullPath $ProjectRoot) -WindowStyle Hidden -PassThru
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $python) { $python = Get-Command python3 -ErrorAction SilentlyContinue }
+    if (-not $python) { throw "Neither python nor python3 was found." }
+    $stdout = Get-ProjectPath ".codex/deepseek-proxy.stdout.log"
+    $stderr = Get-ProjectPath ".codex/deepseek-proxy.stderr.log"
+    $process = Start-Process -FilePath $python.Source -ArgumentList @($shim, "--port", [string]$Port, "--log-path", ".codex/deepseek-proxy.log.jsonl") -WorkingDirectory (Resolve-FullPath $ProjectRoot) -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
     Set-Content -LiteralPath $pidFile -Value $process.Id -Encoding ASCII
     Write-Step "Started proxy PID $($process.Id) on port $Port"
 }
@@ -356,7 +455,49 @@ function Invoke-Doctor {
     catch {
         $checks.proxy_health_error = "Proxy is not running on port $Port. Run start-proxy."
     }
+    $checks.desktop_native_subagent = [ordered]@{
+        configured_agent = "deepseek_worker"
+        worker_config_exists = $checks.worker_exists
+        registry_status = "not_verifiable_from_script"
+        note = "If Codex Desktop returns 'agent type is currently not available', use the delegate fallback. Skills cannot force Desktop to render a native subagent card."
+        fallback_command = "delegate -Mode pro-thinking -Prompt <task>"
+    }
     [pscustomobject]$checks | ConvertTo-Json -Depth 8
+}
+
+function Invoke-DesktopDoctor {
+    Invoke-Doctor
+}
+
+function Invoke-Delegate {
+    if (-not $Prompt -and -not $PromptFile) {
+        throw "delegate requires -Prompt or -PromptFile. It never reads repository files automatically."
+    }
+    if ($Prompt -and $PromptFile) {
+        throw "Use either -Prompt or -PromptFile, not both."
+    }
+    $text = $Prompt
+    if ($PromptFile) {
+        $resolved = Resolve-FullPath $PromptFile
+        if (-not (Test-Path -LiteralPath $resolved)) { throw "PromptFile not found: $resolved" }
+        $text = Get-Content -Raw -LiteralPath $resolved
+    }
+    $result = Invoke-DeepSeekChat -SelectedMode $Mode -TokenLimit $MaxTokens -Messages @(@{ role = "user"; content = $text })
+    [pscustomobject]@{
+        ok = $result.ok
+        mode = $result.mode
+        model = $result.model
+        model_label = $result.model_label
+        thinking_type = $result.thinking_type
+        reasoning_effort = $result.reasoning_effort
+        prompt_chars_sent = $text.Length
+        prompt_tokens = $result.prompt_tokens
+        completion_tokens = $result.completion_tokens
+        reasoning_tokens = $result.reasoning_tokens
+        total_tokens = $result.total_tokens
+        reasoning_content_discarded = $true
+        content = $result.content
+    } | ConvertTo-Json -Depth 8
 }
 
 function Show-Usage {
@@ -366,14 +507,25 @@ function Show-Usage {
         return
     }
     $entries = Get-Content -LiteralPath $log | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json }
-    $summary = [pscustomobject]@{
+    $summary = [ordered]@{
         requests = @($entries | Where-Object { $_.total_tokens }).Count
         prompt_tokens = (@($entries | ForEach-Object { $_.prompt_tokens }) | Measure-Object -Sum).Sum
         completion_tokens = (@($entries | ForEach-Object { $_.completion_tokens }) | Measure-Object -Sum).Sum
         reasoning_tokens = (@($entries | ForEach-Object { $_.reasoning_tokens }) | Measure-Object -Sum).Sum
         total_tokens = (@($entries | ForEach-Object { $_.total_tokens }) | Measure-Object -Sum).Sum
+        by_model_label = @($entries | Where-Object { $_.total_tokens } | Group-Object { if ($_.model_label) { $_.model_label } elseif ($_.thinking_type -eq "enabled") { "$($_.model)(thinking)" } else { $_.model } } | ForEach-Object {
+            $groupEntries = @($_.Group)
+            [pscustomobject]@{
+                model_label = $_.Name
+                requests = $groupEntries.Count
+                prompt_tokens = ($groupEntries | ForEach-Object { $_.prompt_tokens } | Measure-Object -Sum).Sum
+                completion_tokens = ($groupEntries | ForEach-Object { $_.completion_tokens } | Measure-Object -Sum).Sum
+                reasoning_tokens = ($groupEntries | ForEach-Object { $_.reasoning_tokens } | Measure-Object -Sum).Sum
+                total_tokens = ($groupEntries | ForEach-Object { $_.total_tokens } | Measure-Object -Sum).Sum
+            }
+        })
     }
-    $summary | ConvertTo-Json -Compress
+    [pscustomobject]$summary | ConvertTo-Json -Depth 6 -Compress
 }
 
 function Invoke-RedactCheck {
@@ -433,6 +585,8 @@ switch ($Command) {
     "update" { Install-OrUpdate -IsUpdate $true }
     "uninstall" { Uninstall-Project }
     "doctor" { Invoke-Doctor }
+    "desktop-doctor" { Invoke-DesktopDoctor }
+    "delegate" { Invoke-Delegate }
     "start-proxy" { Start-Proxy }
     "stop-proxy" { Stop-Proxy }
     "test-proxy" { Test-Proxy }

@@ -2,4 +2,6 @@
 .codex/*.local.*
 .codex/deepseek-proxy.log.jsonl
 .codex/deepseek-proxy.pid
+.codex/deepseek-proxy.stdout.log
+.codex/deepseek-proxy.stderr.log
 .codex/backups/

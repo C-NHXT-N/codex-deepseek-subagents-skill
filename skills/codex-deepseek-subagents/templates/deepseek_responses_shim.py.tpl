@@ -96,6 +96,7 @@ def build_handler(log_path):
 
             effort = str((payload.get("metadata") or {}).get("deepseek_reasoning_effort") or os.environ.get("DEEPSEEK_THINKING_DEFAULT") or "__THINKING_DEFAULT_SH__")
             thinking = {"type": "disabled"} if effort in {"disabled", "none", "low-cost"} else {"type": "enabled", "reasoning_effort": effort}
+            model_label = f"{model}(thinking)" if thinking["type"] == "enabled" else model
             chat_body = {
                 "model": model,
                 "messages": messages,
@@ -125,6 +126,7 @@ def build_handler(log_path):
                     "upstream_error": str(exc),
                     "upstream_body": body,
                     "model": model,
+                    "model_label": model_label,
                     "thinking_type": thinking["type"],
                     "message_count": len(messages),
                     "request_input_chars": sum(len(m.get("content", "")) for m in messages),
@@ -142,6 +144,7 @@ def build_handler(log_path):
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "path": self.path,
                 "model": model,
+                "model_label": model_label,
                 "thinking_type": thinking["type"],
                 "reasoning_effort": thinking.get("reasoning_effort"),
                 "request_input_chars": sum(len(m.get("content", "")) for m in messages),
@@ -193,4 +196,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -5,18 +5,18 @@
 ## 核心优势
 
 - **GPT 主控，DeepSeek 执行**：把高判断力任务留给 GPT，把实现型任务交给低成本 DeepSeek worker。
-- **显式上下文门禁**：每次派发 DeepSeek 前先提示会发送的任务、文件范围和探索权限，减少 token 消耗和数据外发。
+- **显式上下文门禁**：每次调用 DeepSeek 前先提示将发送的任务、文件范围和探索权限，减少 token 消耗和数据外发。
 - **跨平台一键配置**：支持 Windows PowerShell、PowerShell Core、Linux/macOS bash。
-- **Thinking mode 可控**：简单任务关闭思考，复杂实现/调试按需开启并记录 reasoning token 统计。
-- **本地 Responses proxy**：为 Codex 的 `wire_api = "responses"` 需求提供可测试 shim，便于后续替换为 LiteLLM/Julep 等生产代理。
-- **安全卸载与诊断**：`doctor`、`redact`、`usage`、`uninstall` 帮你检查配置、密钥泄漏、token 用量和清理托管文件。
+- **可靠 fallback**：即使 Codex Desktop 没有注册 `deepseek_worker` 原生子 agent，也能用 `delegate` 直接调用 DeepSeek。
+- **可见模型标签**：fallback/proxy 日志显示 `deepseek-v4-pro(thinking)`、`deepseek-v4-flash(thinking)`、`deepseek-v4-pro` 或 `deepseek-v4-flash`。
+- **安全卸载与诊断**：`doctor`、`desktop-doctor`、`redact`、`usage`、`uninstall` 帮你检查配置、密钥泄漏、token 用量和托管文件。
 
 ## 架构
 
 ```text
 User
   -> GPT main agent: plan / delegate / review
-  -> DeepSeek worker: implement only confirmed tasks
+  -> DeepSeek worker or delegate fallback: execute confirmed tasks only
   -> Local Responses proxy: /v1/responses -> DeepSeek Chat Completions
 ```
 
@@ -29,8 +29,7 @@ Windows PowerShell:
 ```powershell
 powershell -ExecutionPolicy Bypass -File skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 install -ApiKey <deepseek-key>
 powershell -ExecutionPolicy Bypass -File skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 doctor
-powershell -ExecutionPolicy Bypass -File skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 start-proxy
-powershell -ExecutionPolicy Bypass -File skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 test-proxy
+powershell -ExecutionPolicy Bypass -File skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 delegate -Mode pro-thinking -Prompt "只分析我明确提供的公开内容"
 ```
 
 PowerShell Core:
@@ -45,31 +44,45 @@ Linux/macOS:
 ```bash
 bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh install --api-key <deepseek-key>
 bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh doctor
-bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh start-proxy
-bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh test-proxy
+bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh delegate --mode pro-thinking --prompt "只分析我明确提供的公开内容"
 ```
 
 ## 命令
 
 - `install`：生成 Codex provider、DeepSeek worker、local env、proxy shim、测试脚本和 `.gitignore` 规则。
 - `update`：更新 API key、模型、base URL、port、thinking 默认策略。
-- `uninstall`：只删除带 `# Managed by codex-deepseek-subagents` 标记的托管文件。
-- `doctor`：检查文件、gitignore、DeepSeek direct API、thinking mode 和 proxy health。
+- `delegate`：当 Desktop 原生 subagent 不可用时，直接调用 DeepSeek fallback。
+- `doctor` / `desktop-doctor`：检查文件、gitignore、DeepSeek direct API、thinking mode、proxy health 和 Desktop native subagent 提示。
 - `start-proxy` / `stop-proxy` / `test-proxy`：管理本地 `/v1/responses` shim。
-- `usage`：汇总 proxy 日志里的 prompt/completion/reasoning tokens。
+- `usage`：汇总 proxy 日志里的 prompt/completion/reasoning tokens，并按模型标签分组。
 - `redact`：扫描非 `.local` 文件中的疑似 API key。
 - `export-shareable`：导出不含密钥、日志、备份的 shareable skill zip。
+- `uninstall`：只删除带 `# Managed by codex-deepseek-subagents` 标记的托管文件。
 
 常用选项：
 
-- `-ProjectRoot <path>` / `--project-root <path>`：安装到指定项目。
-- `-Model` / `--model`：设置 DeepSeek worker 模型，默认 `deepseek-v4-pro`。
-- `-FastModel` / `--fast-model`：设置快速模型，默认 `deepseek-v4-flash`。
-- `-Port` / `--port`：设置本地 proxy 端口，默认 `4000`。
-- `-ThinkingDefault disabled|high|max` / `--thinking-default disabled|high|max`。
-- `-DryRun` / `--dry-run`：只展示将要执行的动作。
-- `-Force` / `--force`：确认后覆盖非托管目标文件。
-- `-RemoveSkill` / `--remove-skill`：卸载时连 skill 文件夹一起删除。
+- `-Mode pro-thinking|flash-thinking|pro|flash` / `--mode ...`
+- `-Prompt <text>` / `--prompt <text>`
+- `-PromptFile <path>` / `--prompt-file <path>`
+- `-MaxTokens <n>` / `--max-tokens <n>`
+- `-DryRun` / `--dry-run`
+- `-Force` / `--force`
+- `-RemoveSkill` / `--remove-skill`
+
+## 桌面端可视化说明
+
+Codex Desktop 原生 subagent 卡片由 Desktop runtime 的 agent registry 控制。这个 skill 可以安装 `.codex/agents/deepseek-worker.toml`，但不能强制 Desktop 注册或渲染自定义 `deepseek_worker` 卡片。
+
+当前可保证的显示方式是 fallback/proxy 输出：
+
+| Mode | Model label |
+| --- | --- |
+| `pro-thinking` | `deepseek-v4-pro(thinking)` |
+| `flash-thinking` | `deepseek-v4-flash(thinking)` |
+| `pro` | `deepseek-v4-pro` |
+| `flash` | `deepseek-v4-flash` |
+
+如果未来 Codex Desktop 支持自定义 agent registry，现有 `.codex/agents/deepseek-worker.toml` 可以继续作为原生路径使用。
 
 ## 文件结构
 
@@ -96,36 +109,24 @@ skills/codex-deepseek-subagents/
 ## 安全与隐私
 
 - DeepSeek 只应在用户确认 delegation 后接收上下文。
-- 默认发送最小任务说明和必要路径，避免泛读全仓库。
-- `reasoning_content` 不会写入日志，也不应回灌到后续 prompt。
+- fallback `delegate` 只发送 `Prompt` 或 `PromptFile` 明确提供的内容，不自动读取仓库。
+- `reasoning_content` 不写入日志，也不应回灌到后续 prompt。
 - 运行 `redact` 检查密钥泄漏，运行 `usage` 查看 token 成本。
-- 本地 smoke-test proxy 适合验证链路；生产环境建议评估 LiteLLM、Julep Open Responses 或自研更完整的 Responses gateway。
-
-## FAQ
-
-**这个 skill 会自动把所有上下文发给 DeepSeek 吗？**  
-不会。设计目标是 GPT 主 agent 在派发前明确提示范围，用户确认后才调用 DeepSeek worker。
-
-**为什么需要 proxy？**  
-Codex 自定义 provider 需要 Responses-compatible endpoint，而 DeepSeek 公开 API 主要是 OpenAI/Anthropic-compatible。这个 skill 提供本地 shim 用于测试 `/v1/responses` 链路。
-
-**能完全禁止 GPT 写文件吗？**  
-skill 能提供行为约束和工作流门禁，但硬隔离需要额外权限边界或 gateway 设计。
 
 ---
 
 # Codex DeepSeek Subagents Skill
 
-Keep GPT as the Codex planner/reviewer and delegate explicit implementation work to DeepSeek only after user confirmation. This skill packages a cost-aware, context-gated multi-agent workflow with one-command setup, diagnostics, local proxy testing, and safe uninstall.
+Keep GPT as the Codex planner/reviewer and delegate explicit implementation work to DeepSeek only after user confirmation. The skill provides one-command setup, diagnostics, local proxy testing, safe uninstall, and a reliable `delegate` fallback for Codex Desktop sessions that do not register custom subagents.
 
 ## Highlights
 
 - **GPT controls, DeepSeek implements**: GPT plans, dispatches, and reviews; DeepSeek handles bounded worker tasks.
 - **Context gate by default**: show the task, paths, and exploration scope before sending anything to DeepSeek.
 - **Cross-platform setup**: Windows PowerShell, PowerShell Core, Linux, and macOS are supported.
-- **Thinking mode policy**: disable thinking for simple tasks; enable it for complex implementation or debugging with token accounting.
-- **Local Responses proxy**: test Codex `wire_api = "responses"` flow against DeepSeek Chat Completions.
-- **Friendly operations**: install, update, doctor, usage, redact, export, and safe uninstall.
+- **Reliable fallback**: `delegate` works even when Codex Desktop does not expose a native `deepseek_worker` card.
+- **Visible model labels**: outputs/logs show `deepseek-v4-pro(thinking)`, `deepseek-v4-flash(thinking)`, `deepseek-v4-pro`, or `deepseek-v4-flash`.
+- **Friendly operations**: install, update, doctor, desktop-doctor, delegate, usage, redact, export, and safe uninstall.
 
 ## Install
 
@@ -145,8 +146,7 @@ Then run:
 
 ```bash
 bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh doctor
-bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh start-proxy
-bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh test-proxy
+bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh delegate --mode pro-thinking --prompt "Analyze only the explicit context I provide."
 ```
 
 Use the `.ps1` script for the same commands on Windows.
@@ -154,12 +154,16 @@ Use the `.ps1` script for the same commands on Windows.
 ## Commands
 
 - `install`: create managed Codex config, DeepSeek worker, local env, proxy, tests, and gitignore rules.
-- `update`: refresh API key, model, URLs, port, and thinking defaults.
-- `uninstall`: remove only managed files; add `-RemoveSkill` or `--remove-skill` to remove the skill folder.
-- `doctor`: verify local files, DeepSeek API, thinking mode, and proxy health.
-- `usage`: summarize token usage from proxy logs.
+- `delegate`: direct DeepSeek fallback with explicit prompt or prompt file.
+- `doctor` / `desktop-doctor`: verify files, DeepSeek API, thinking mode, proxy health, and Desktop native-subagent caveats.
+- `usage`: summarize token usage from proxy logs by model label.
 - `redact`: scan for leaked keys outside local secret files.
 - `export-shareable`: build a clean shareable zip.
+- `uninstall`: remove only managed files; add `-RemoveSkill` or `--remove-skill` to remove the skill folder.
+
+## Desktop Visualization
+
+Native subagent cards are controlled by Codex Desktop itself. This skill installs the agent config, but it cannot force Desktop to register or render a custom `deepseek_worker` card. When native registration is unavailable, use `delegate`; it prints the exact DeepSeek model/thinking label and token accounting.
 
 ## Safety
 
@@ -168,4 +172,3 @@ API keys are written only to `.codex/*.local.*` and are ignored by git. Reposito
 ## License
 
 MIT License. See [LICENSE](LICENSE).
-
