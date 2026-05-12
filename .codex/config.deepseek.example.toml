@@ -1,0 +1,13 @@
+# Example Codex configuration for a DeepSeek worker behind a Responses-compatible proxy.
+# Do not put API keys in this file. Load .codex/deepseek.local.env.ps1 locally instead.
+
+[agents]
+max_threads = 6
+max_depth = 1
+
+[model_providers.deepseek_responses]
+name = "DeepSeek via Responses Proxy"
+base_url = "http://127.0.0.1:4000/v1"
+wire_api = "responses"
+env_key = "DEEPSEEK_PROXY_API_KEY"
+

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex + DeepSeek Subagents"
+  short_description: "配置 GPT 主控、DeepSeek 执行的 Codex 多 agent 工作流。"
+  default_prompt: "Use $codex-deepseek-subagents 帮助我搭建或审查 Codex GPT 主 agent + DeepSeek worker subagent 配置。"
