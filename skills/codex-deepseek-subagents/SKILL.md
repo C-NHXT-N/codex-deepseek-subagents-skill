@@ -7,7 +7,16 @@ description: Install, update, test, or remove a cost-optimized Codex multi-agent
 
 ## Quick Start
 
-Use the bundled PowerShell script instead of hand-writing project config. The script installs only into the target project `.codex/` folder and writes API keys only to `.codex/deepseek.local.env.ps1`, which it adds to `.gitignore`.
+Use the bundled script instead of hand-writing project config. The scripts install only into the target project `.codex/` folder and write API keys only to `.codex/deepseek.local.env.ps1` or `.codex/deepseek.local.env.sh`, which they add to `.gitignore`.
+
+Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 install -ApiKey <deepseek-key>
+powershell -ExecutionPolicy Bypass -File skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 doctor
+```
+
+PowerShell Core on any platform:
 
 ```powershell
 pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 install -ApiKey <deepseek-key>
@@ -16,7 +25,14 @@ pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 start-proxy
 pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 test-proxy
 ```
 
-On Windows systems without PowerShell Core, use `powershell -ExecutionPolicy Bypass -File` instead of `pwsh`.
+Linux/macOS shell:
+
+```bash
+bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh install --api-key <deepseek-key>
+bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh doctor
+bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh start-proxy
+bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh test-proxy
+```
 
 Run destructive or broad actions with `-DryRun` first:
 

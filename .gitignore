@@ -1,3 +1,5 @@
 # Local secret/test configs
 .codex/*.local.*
 .codex/deepseek-proxy.log.jsonl
+.codex/deepseek-proxy.pid
+.codex/backups/

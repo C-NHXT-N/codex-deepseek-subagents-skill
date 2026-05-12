@@ -51,6 +51,12 @@ function Escape-TomlString {
     return $Value.Replace("\", "\\").Replace('"', '\"')
 }
 
+function Escape-ShString {
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) { return "" }
+    return $Value.Replace("'", "'\''")
+}
+
 function Expand-Template {
     param([string]$TemplateName)
     $content = Get-Content -Raw (Join-Path $TemplateRoot $TemplateName)
@@ -61,6 +67,12 @@ function Expand-Template {
     $content = $content.Replace("__FAST_MODEL_PS__", (Escape-TemplateValue $FastModel))
     $content = $content.Replace("__THINKING_DEFAULT_PS__", (Escape-TemplateValue $ThinkingDefault))
     $content = $content.Replace("__MODEL_TOML__", (Escape-TomlString $Model))
+    $content = $content.Replace("__API_KEY_SH__", (Escape-ShString $ApiKey))
+    $content = $content.Replace("__BASE_URL_SH__", (Escape-ShString $BaseUrl))
+    $content = $content.Replace("__ANTHROPIC_BASE_URL_SH__", (Escape-ShString $AnthropicBaseUrl))
+    $content = $content.Replace("__MODEL_SH__", (Escape-ShString $Model))
+    $content = $content.Replace("__FAST_MODEL_SH__", (Escape-ShString $FastModel))
+    $content = $content.Replace("__THINKING_DEFAULT_SH__", (Escape-ShString $ThinkingDefault))
     $content = $content.Replace("__PORT__", [string]$Port)
     return $content
 }
@@ -68,8 +80,8 @@ function Expand-Template {
 function Test-ManagedFile {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
-    $firstLine = Get-Content -LiteralPath $Path -TotalCount 1 -ErrorAction SilentlyContinue
-    return $firstLine -eq $ManagedMarker
+    $header = Get-Content -LiteralPath $Path -TotalCount 3 -ErrorAction SilentlyContinue
+    return @($header) -contains $ManagedMarker
 }
 
 function Ensure-Directory {
@@ -116,6 +128,12 @@ function Write-ManagedFile {
         return
     }
     Set-Content -LiteralPath $Path -Value $Content -Encoding UTF8
+    if ($Path -match '\.(sh|py)$') {
+        try {
+            if (-not $IsWindows) { chmod +x $Path }
+        }
+        catch {}
+    }
 }
 
 function Add-GitIgnoreRules {
@@ -160,9 +178,13 @@ function Install-OrUpdate {
     Write-ManagedFile (Get-ProjectPath ".codex/config.toml") (Expand-Template "config.toml.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/agents/deepseek-worker.toml") (Expand-Template "deepseek-worker.toml.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/deepseek.local.env.ps1") (Expand-Template "deepseek.local.env.ps1.tpl") -Secret
+    Write-ManagedFile (Get-ProjectPath ".codex/deepseek.local.env.sh") (Expand-Template "deepseek.local.env.sh.tpl") -Secret
     Write-ManagedFile (Get-ProjectPath ".codex/deepseek-responses-shim.ps1") (Expand-Template "deepseek-responses-shim.ps1.tpl")
+    Write-ManagedFile (Get-ProjectPath ".codex/deepseek_responses_shim.py") (Expand-Template "deepseek_responses_shim.py.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/test-deepseek-direct.ps1") (Expand-Template "test-deepseek-direct.ps1.tpl")
+    Write-ManagedFile (Get-ProjectPath ".codex/test-deepseek-direct.sh") (Expand-Template "test-deepseek-direct.sh.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/test-responses-proxy.ps1") (Expand-Template "test-responses-proxy.ps1.tpl")
+    Write-ManagedFile (Get-ProjectPath ".codex/test-responses-proxy.sh") (Expand-Template "test-responses-proxy.sh.tpl")
     Add-GitIgnoreRules
     Write-Step "$(if ($IsUpdate) { 'Update' } else { 'Install' }) complete."
 }
@@ -188,9 +210,13 @@ function Uninstall-Project {
         ".codex/config.toml",
         ".codex/agents/deepseek-worker.toml",
         ".codex/deepseek.local.env.ps1",
+        ".codex/deepseek.local.env.sh",
         ".codex/deepseek-responses-shim.ps1",
+        ".codex/deepseek_responses_shim.py",
         ".codex/test-deepseek-direct.ps1",
-        ".codex/test-responses-proxy.ps1"
+        ".codex/test-deepseek-direct.sh",
+        ".codex/test-responses-proxy.ps1",
+        ".codex/test-responses-proxy.sh"
     )
     foreach ($relative in $paths) {
         Remove-ManagedPath (Get-ProjectPath $relative)
@@ -276,7 +302,10 @@ function Start-Proxy {
         Write-Step "Would start proxy: $shim on port $Port"
         return
     }
-    $process = Start-Process -FilePath "powershell" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $shim, "-Port", [string]$Port, "-LogPath", ".codex/deepseek-proxy.log.jsonl") -WorkingDirectory (Resolve-FullPath $ProjectRoot) -WindowStyle Hidden -PassThru
+    $shell = Get-Command pwsh -ErrorAction SilentlyContinue
+    if (-not $shell) { $shell = Get-Command powershell -ErrorAction SilentlyContinue }
+    if (-not $shell) { throw "Neither pwsh nor powershell was found." }
+    $process = Start-Process -FilePath $shell.Source -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $shim, "-Port", [string]$Port, "-LogPath", ".codex/deepseek-proxy.log.jsonl") -WorkingDirectory (Resolve-FullPath $ProjectRoot) -WindowStyle Hidden -PassThru
     Set-Content -LiteralPath $pidFile -Value $process.Id -Encoding ASCII
     Write-Step "Started proxy PID $($process.Id) on port $Port"
 }
