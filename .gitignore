@@ -5,3 +5,4 @@
 .codex/deepseek-proxy.stdout.log
 .codex/deepseek-proxy.stderr.log
 .codex/backups/
+codex-deepseek-subagents-plugin/

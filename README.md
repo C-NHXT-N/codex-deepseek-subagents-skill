@@ -126,6 +126,7 @@ Keep GPT as the Codex planner/reviewer and delegate explicit implementation work
 - **Cross-platform setup**: Windows PowerShell, PowerShell Core, Linux, and macOS are supported.
 - **Reliable fallback**: `delegate` works even when Codex Desktop does not expose a native `deepseek_worker` card.
 - **Visible model labels**: outputs/logs show `deepseek-v4-pro(thinking)`, `deepseek-v4-flash(thinking)`, `deepseek-v4-pro`, or `deepseek-v4-flash`.
+- **Controllable reasoning display**: `ThinkingView` supports hidden, summary, or one-shot raw reasoning output. Hidden is the default.
 - **Friendly operations**: install, update, doctor, desktop-doctor, delegate, usage, redact, export, and safe uninstall.
 
 ## Install
@@ -146,7 +147,7 @@ Then run:
 
 ```bash
 bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh doctor
-bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh delegate --mode pro-thinking --prompt "Analyze only the explicit context I provide."
+bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh delegate --mode pro-thinking --thinking-view hidden --prompt "Analyze only the explicit context I provide."
 ```
 
 Use the `.ps1` script for the same commands on Windows.
@@ -155,6 +156,7 @@ Use the `.ps1` script for the same commands on Windows.
 
 - `install`: create managed Codex config, DeepSeek worker, local env, proxy, tests, and gitignore rules.
 - `delegate`: direct DeepSeek fallback with explicit prompt or prompt file.
+- `ThinkingView`: `hidden` hides raw reasoning, `summary` asks for a short final reasoning summary, and `raw` prints raw reasoning only in the current JSON output.
 - `doctor` / `desktop-doctor`: verify files, DeepSeek API, thinking mode, proxy health, and Desktop native-subagent caveats.
 - `usage`: summarize token usage from proxy logs by model label.
 - `redact`: scan for leaked keys outside local secret files.
@@ -167,7 +169,7 @@ Native subagent cards are controlled by Codex Desktop itself. This skill install
 
 ## Safety
 
-API keys are written only to `.codex/*.local.*` and are ignored by git. Repository content should be sent to DeepSeek only after an explicit handoff confirmation. The proxy logs token metadata and discards hidden reasoning content.
+API keys are written only to `.codex/*.local.*` and are ignored by git. Repository content should be sent to DeepSeek only after an explicit handoff confirmation. The proxy logs token metadata and discards hidden reasoning content. Even when `ThinkingView raw` is used, raw reasoning is only printed in that command response and should not be copied into later prompts.
 
 ## License
 

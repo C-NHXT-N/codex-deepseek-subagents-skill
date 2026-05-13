@@ -18,6 +18,8 @@ param(
     [switch]$RemoveSkill,
     [ValidateSet("pro-thinking", "flash-thinking", "pro", "flash")]
     [string]$Mode = "pro-thinking",
+    [ValidateSet("hidden", "summary", "raw")]
+    [string]$ThinkingView = "hidden",
     [string]$Prompt = "",
     [string]$PromptFile = "",
     [int]$MaxTokens = 2048,
@@ -338,6 +340,7 @@ function Invoke-DeepSeekChat {
             reasoning_effort = if ($spec.thinking.reasoning_effort) { $spec.thinking.reasoning_effort } else { $null }
             finish_reason = $response.choices[0].finish_reason
             content = $message.content
+            reasoning_content = $message.reasoning_content
             has_reasoning_content = [bool]$message.reasoning_content
             reasoning_chars_discarded = if ($message.reasoning_content) { ([string]$message.reasoning_content).Length } else { 0 }
             prompt_tokens = $usage.prompt_tokens
@@ -482,22 +485,30 @@ function Invoke-Delegate {
         if (-not (Test-Path -LiteralPath $resolved)) { throw "PromptFile not found: $resolved" }
         $text = Get-Content -Raw -LiteralPath $resolved
     }
+    if ($ThinkingView -eq "summary") {
+        $text = "$text`n`nAt the end of the final answer, add a short section titled 'Reasoning summary'. Summarize only the key decision factors. Do not reveal or restate hidden chain-of-thought or raw reasoning content."
+    }
     $result = Invoke-DeepSeekChat -SelectedMode $Mode -TokenLimit $MaxTokens -Messages @(@{ role = "user"; content = $text })
-    [pscustomobject]@{
+    $output = [ordered]@{
         ok = $result.ok
         mode = $result.mode
         model = $result.model
         model_label = $result.model_label
         thinking_type = $result.thinking_type
         reasoning_effort = $result.reasoning_effort
+        thinking_view = $ThinkingView
         prompt_chars_sent = $text.Length
         prompt_tokens = $result.prompt_tokens
         completion_tokens = $result.completion_tokens
         reasoning_tokens = $result.reasoning_tokens
         total_tokens = $result.total_tokens
-        reasoning_content_discarded = $true
+        reasoning_content_discarded = ($ThinkingView -ne "raw")
         content = $result.content
-    } | ConvertTo-Json -Depth 8
+    }
+    if ($ThinkingView -eq "raw") {
+        $output["reasoning_content"] = $result.reasoning_content
+    }
+    [pscustomobject]$output | ConvertTo-Json -Depth 8
 }
 
 function Show-Usage {

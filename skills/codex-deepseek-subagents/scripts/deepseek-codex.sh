@@ -19,6 +19,7 @@ FORCE=0
 REMOVE_SKILL=0
 OUT_FILE=""
 MODE="pro-thinking"
+THINKING_VIEW="hidden"
 PROMPT=""
 PROMPT_FILE=""
 MAX_TOKENS="2048"
@@ -45,6 +46,7 @@ Options:
   --port PORT
   --thinking-default disabled|high|max
   --mode pro-thinking|flash-thinking|pro|flash
+  --thinking-view hidden|summary|raw
   --prompt TEXT
   --prompt-file PATH
   --max-tokens N
@@ -67,6 +69,7 @@ while [[ $# -gt 0 ]]; do
     --port|-Port) PORT="$2"; shift 2 ;;
     --thinking-default|-ThinkingDefault) THINKING_DEFAULT="$2"; shift 2 ;;
     --mode|-Mode) MODE="$2"; shift 2 ;;
+    --thinking-view|-ThinkingView) THINKING_VIEW="$2"; shift 2 ;;
     --prompt|-Prompt) PROMPT="$2"; shift 2 ;;
     --prompt-file|-PromptFile) PROMPT_FILE="$2"; shift 2 ;;
     --max-tokens|-MaxTokens) MAX_TOKENS="$2"; shift 2 ;;
@@ -81,6 +84,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 PROJECT_ROOT="$(cd "$PROJECT_ROOT" && pwd)"
+
+case "$THINKING_VIEW" in
+  hidden|summary|raw) ;;
+  *) echo "Invalid thinking view: $THINKING_VIEW. Use hidden, summary, or raw." >&2; exit 2 ;;
+esac
 
 step() {
   printf '[codex-deepseek-subagents] %s\n' "$*"
@@ -334,17 +342,20 @@ delegate() {
     echo "Use either --prompt or --prompt-file, not both." >&2
     exit 1
   fi
-  MODE_ENV="$MODE" PROMPT_ENV="$PROMPT" PROMPT_FILE_ENV="$PROMPT_FILE" MAX_TOKENS_ENV="$MAX_TOKENS" python3 - <<'PY'
+  MODE_ENV="$MODE" THINKING_VIEW_ENV="$THINKING_VIEW" PROMPT_ENV="$PROMPT" PROMPT_FILE_ENV="$PROMPT_FILE" MAX_TOKENS_ENV="$MAX_TOKENS" python3 - <<'PY'
 import json
 import os
 import urllib.request
 
 mode = os.environ["MODE_ENV"]
+thinking_view = os.environ["THINKING_VIEW_ENV"]
 prompt = os.environ.get("PROMPT_ENV") or ""
 prompt_file = os.environ.get("PROMPT_FILE_ENV") or ""
 if prompt_file:
     with open(prompt_file, encoding="utf-8") as handle:
         prompt = handle.read()
+if thinking_view == "summary":
+    prompt = prompt + "\n\nAt the end of the final answer, add a short section titled 'Reasoning summary'. Summarize only the key decision factors. Do not reveal or restate hidden chain-of-thought or raw reasoning content."
 
 model_map = {
     "pro-thinking": (os.environ["DEEPSEEK_OPENAI_MODEL"], {"type": "enabled", "reasoning_effort": "high"}),
@@ -374,21 +385,25 @@ with urllib.request.urlopen(req, timeout=300) as res:
 message = data["choices"][0]["message"]
 usage = data.get("usage") or {}
 details = usage.get("completion_tokens_details") or {}
-print(json.dumps({
+output = {
     "ok": True,
     "mode": mode,
     "model": data.get("model"),
     "model_label": model_label,
     "thinking_type": thinking["type"],
     "reasoning_effort": thinking.get("reasoning_effort"),
+    "thinking_view": thinking_view,
     "prompt_chars_sent": len(prompt),
     "prompt_tokens": usage.get("prompt_tokens"),
     "completion_tokens": usage.get("completion_tokens"),
     "reasoning_tokens": details.get("reasoning_tokens"),
     "total_tokens": usage.get("total_tokens"),
-    "reasoning_content_discarded": True,
+    "reasoning_content_discarded": thinking_view != "raw",
     "content": message.get("content"),
-}, ensure_ascii=False, indent=2))
+}
+if thinking_view == "raw":
+    output["reasoning_content"] = message.get("reasoning_content")
+print(json.dumps(output, ensure_ascii=False, indent=2))
 PY
 }
 

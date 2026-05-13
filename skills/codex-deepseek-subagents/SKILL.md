@@ -21,7 +21,7 @@ PowerShell Core on any platform:
 ```powershell
 pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 install -ApiKey <deepseek-key>
 pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 doctor
-pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 delegate -Mode pro-thinking -Prompt "Summarize the files I explicitly provide."
+pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 delegate -Mode pro-thinking -ThinkingView hidden -Prompt "Summarize the files I explicitly provide."
 pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 start-proxy
 pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 test-proxy
 ```
@@ -31,7 +31,7 @@ Linux/macOS shell:
 ```bash
 bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh install --api-key <deepseek-key>
 bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh doctor
-bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh delegate --mode pro-thinking --prompt "Summarize the files I explicitly provide."
+bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh delegate --mode pro-thinking --thinking-view hidden --prompt "Summarize the files I explicitly provide."
 bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh start-proxy
 bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh test-proxy
 ```
@@ -63,6 +63,7 @@ Useful options:
 - `-Port 4000`: choose the local proxy port.
 - `-ThinkingDefault disabled|high|max`: set proxy default thinking behavior.
 - `-Mode pro-thinking|flash-thinking|pro|flash`: select the DeepSeek delegate model and thinking mode.
+- `-ThinkingView hidden|summary|raw`: choose how `delegate` handles DeepSeek reasoning content.
 - `-Prompt <text>` or `-PromptFile <path>`: explicit content to send with `delegate`; no files are read automatically.
 - `-MaxTokens <n>`: output token cap for `delegate`.
 - `-DryRun`: print intended changes without writing.
@@ -100,6 +101,12 @@ Use DeepSeek thinking mode only when it is worth the token cost:
 - Ambiguous architecture or hard agentic work: use `reasoning_effort = "max"` only after warning about extra cost.
 
 Never persist or feed `reasoning_content` back into prompts. Keep only coarse metadata such as reasoning token counts and whether reasoning was present.
+
+`delegate` has three user-facing reasoning display modes:
+
+- `hidden` (default): do not print raw `reasoning_content`; show model label and token counts only.
+- `summary`: ask DeepSeek to add a short reasoning summary to the final answer while still hiding raw `reasoning_content`.
+- `raw`: print raw `reasoning_content` in this command's JSON output only. Do not store it in logs, do not copy it into follow-up prompts, and warn the user before using it because it may increase exposure of sensitive task context.
 
 Visible labels used by fallback and proxy logs:
 
