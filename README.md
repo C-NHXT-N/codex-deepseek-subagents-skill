@@ -72,7 +72,12 @@ The local scheduler runtime is a single Python process. It serves:
 - `POST /v1/tasks/{task_id}/retry`
 - `POST /v1/responses`
 
-`/v1/responses` is still a smoke-test compatibility endpoint. `stream=true`, `tools`, and `tool_choice` return `400` with an explicit message instead of being silently ignored. In v1, this means the scheduler supports approved text delegation to DeepSeek, not native Codex tool-calling execution by DeepSeek.
+`/v1/responses` now supports two modes:
+
+- Text compatibility mode for the existing smoke-test path.
+- Approved native tool mode for `execution` tasks that carry a `tool_policy` and are referenced through `metadata.scheduler_task_id`.
+
+`stream=true` still returns `400`. Shell command execution is intentionally disabled in v1.
 
 ## Agent Registry
 
@@ -87,7 +92,7 @@ Default routes:
 - `review` -> `codex_main`
 - `execution` -> `deepseek_worker`
 
-Execution tasks must be approved before the scheduler dispatches them.
+Execution tasks must be approved before the scheduler dispatches them. Native tool execution binds every repository read/write to an approved execution task.
 
 ## Commands
 
@@ -121,9 +126,9 @@ Do not persist or replay raw `reasoning_content`. Logs record task metadata, sta
 `doctor` reports two separate readiness flags:
 
 - `text_delegate_ready`: approved text delegation through the scheduler can be used.
-- `native_tool_agent_ready`: always `false` in v1 because the smoke-test Responses endpoint does not implement tool-calling.
+- `native_tool_agent_ready`: approved repository tools are available through the scheduler runtime.
 
-If you need DeepSeek to directly read, edit, and verify files as a native Codex execution agent, replace the smoke-test `/v1/responses` adapter with a production Responses-compatible proxy that implements tools.
+Supported native tools are `repo_list_files`, `repo_read_file`, `repo_search_text`, `repo_apply_patch`, `repo_write_file`, and optionally `repo_delete_file` when a task explicitly approves deletion. `stream=true` and shell execution remain out of scope for this version.
 
 ## Development
 

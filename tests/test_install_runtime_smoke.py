@@ -7,7 +7,6 @@ import sys
 import tempfile
 import time
 import unittest
-import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,13 +23,30 @@ class FakeDeepSeekHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        messages = payload.get("messages") or []
+        system_text = "\n".join(str(message.get("content") or "") for message in messages if message.get("role") == "system")
+        if "DeepSeek native repository worker" in system_text:
+            joined = "\n".join(str(message.get("content") or "") for message in messages)
+            if '"tool_name": "repo_read_file"' not in joined and '"tool_name":"repo_read_file"' not in joined:
+                content = json.dumps({
+                    "type": "tool_call",
+                    "tool_name": "repo_read_file",
+                    "arguments": {"path": "README.md"},
+                })
+            else:
+                content = json.dumps({
+                    "type": "final",
+                    "content": "install-native-ok",
+                })
+        else:
+            content = "install-smoke-ok"
         body = {
             "id": "chatcmpl-install-smoke",
             "model": payload["model"],
             "choices": [{
                 "finish_reason": "stop",
                 "message": {
-                    "content": "install-smoke-ok",
+                    "content": content,
                     "reasoning_content": "hidden scratchpad",
                 },
             }],
@@ -57,9 +73,10 @@ def free_port():
 
 class InstalledRuntimeSmokeTests(unittest.TestCase):
     @unittest.skipIf(shutil.which("bash") is None, "bash is required for install smoke test")
-    def test_bash_install_runtime_health_agents_task_and_approval(self):
+    def test_bash_install_runtime_health_agents_text_and_native_tool_flow(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            (root / "README.md").write_text("hello\n", encoding="utf-8")
             upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeDeepSeekHandler)
             import threading
             upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
@@ -134,33 +151,26 @@ class InstalledRuntimeSmokeTests(unittest.TestCase):
 
                 self.assertTrue(health["ok"])
                 self.assertTrue(health["capabilities"]["text_delegate_ready"])
-                self.assertFalse(health["capabilities"]["native_tool_agent_ready"])
+                self.assertTrue(health["capabilities"]["native_tool_agent_ready"])
 
                 with urllib.request.urlopen(f"{base}/v1/agents", timeout=2) as res:
                     agents = json.loads(res.read().decode("utf-8"))
                 self.assertEqual(len(agents["data"]), 2)
-
-                unsupported_req = urllib.request.Request(
-                    f"{base}/v1/responses",
-                    data=json.dumps({"tool_choice": "auto"}).encode("utf-8"),
-                    headers={
-                        "Authorization": "Bearer sk-test-placeholder",
-                        "Content-Type": "application/json",
-                    },
-                    method="POST",
-                )
-                with self.assertRaises(urllib.error.HTTPError) as ctx:
-                    urllib.request.urlopen(unsupported_req, timeout=2)
-                self.assertEqual(ctx.exception.code, 400)
+                self.assertTrue(agents["capabilities"]["responses_tool_calling"])
 
                 task_req = urllib.request.Request(
                     f"{base}/v1/tasks",
                     data=json.dumps({
                         "type": "execution",
-                        "description": "Install smoke execution",
-                        "allowed_paths": ["README.md"],
+                        "description": "Native smoke execution",
+                        "tool_policy": {
+                            "allowed_paths": ["README.md"],
+                            "allowed_tools": ["repo_read_file"],
+                            "read_extensions": [".md"],
+                            "write_extensions": [".md"],
+                        },
                         "approval_scope": {
-                            "summary": "install smoke summary",
+                            "summary": "read README.md",
                             "files": ["README.md"],
                             "exploration": "listed paths only",
                         },
@@ -180,8 +190,26 @@ class InstalledRuntimeSmokeTests(unittest.TestCase):
                 )
                 with urllib.request.urlopen(approve_req, timeout=5) as res:
                     approved = json.loads(res.read().decode("utf-8"))
-                self.assertEqual(approved["status"], "success")
-                self.assertEqual(approved["result"]["content"], "install-smoke-ok")
+                self.assertEqual(approved["status"], "approved")
+
+                tool_req = urllib.request.Request(
+                    f"{base}/v1/responses",
+                    data=json.dumps({
+                        "input": [{"role": "user", "content": "Read README.md and summarize success."}],
+                        "tools": [{"type": "function", "function": {"name": "repo_read_file"}}],
+                        "tool_choice": "auto",
+                        "metadata": {"scheduler_task_id": task["task_id"]},
+                    }).encode("utf-8"),
+                    headers={
+                        "Authorization": "Bearer sk-test-placeholder",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(tool_req, timeout=5) as res:
+                    response = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(response["status"], "completed")
+                self.assertEqual(response["output_text"], "install-native-ok")
             finally:
                 if runtime is not None:
                     runtime.terminate()

@@ -470,6 +470,7 @@ if user_config_exists:
             and isinstance(user_config.get("runtime"), dict)
             and isinstance(user_config.get("connected_agents"), list)
             and isinstance(user_config.get("defaults"), dict)
+            and isinstance(user_config.get("defaults", {}).get("tool_policy"), dict)
         )
         checks["agent_registry_summary"] = [
             {
@@ -489,11 +490,17 @@ checks["collaboration_capabilities"] = {
         and runtime_entry_exists
         and env_exists
     ),
-    "native_tool_agent_ready": False,
+    "native_tool_agent_ready": bool(
+        checks.get("user_config_valid")
+        and runtime_entry_exists
+    ),
     "responses_smoke_test": True,
-    "responses_tool_calling": False,
-    "unsupported_responses_features": ["stream=true", "tools", "tool_choice"],
-    "note": "v1 supports approved text delegation through the scheduler. Native tool-calling subagent execution requires a future production Responses proxy.",
+    "responses_tool_calling": True,
+    "supported_tools": ["repo_list_files", "repo_read_file", "repo_search_text", "repo_apply_patch", "repo_write_file", "repo_delete_file"],
+    "unsupported_responses_features": ["stream=true"],
+    "stream_supported": False,
+    "shell_supported": False,
+    "note": "Runtime supports approved native repository tools through execution tasks. Shell command execution remains disabled.",
 }
 if os.environ.get("DEEPSEEK_DOCTOR_ENV_LOADED") != "1":
     checks["direct_api_error"] = "Missing local env file: .codex/deepseek.local.env.sh. Run install first."

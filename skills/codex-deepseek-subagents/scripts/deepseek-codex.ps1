@@ -651,7 +651,8 @@ function Invoke-Doctor {
             $checks.user_config_valid = (-not ($userConfigPropertyNames -contains "deepseek_api_key")) -and
                 ($userConfigPropertyNames -contains "runtime") -and
                 ($userConfigPropertyNames -contains "connected_agents") -and
-                ($userConfigPropertyNames -contains "defaults")
+                ($userConfigPropertyNames -contains "defaults") -and
+                ($null -ne $userConfig.defaults.tool_policy)
             $checks.agent_registry_summary = @($userConfig.connected_agents | Where-Object { $_.enabled -ne $false } | ForEach-Object {
                 [ordered]@{
                     name = $_.name
@@ -667,11 +668,14 @@ function Invoke-Doctor {
     }
     $checks.collaboration_capabilities = [ordered]@{
         text_delegate_ready = $checks.user_config_valid -and $checks.runtime_entry_exists -and $checks.env_exists
-        native_tool_agent_ready = $false
+        native_tool_agent_ready = $checks.user_config_valid -and $checks.runtime_entry_exists
         responses_smoke_test = $true
-        responses_tool_calling = $false
-        unsupported_responses_features = @("stream=true", "tools", "tool_choice")
-        note = "v1 supports approved text delegation through the scheduler. Native tool-calling subagent execution requires a future production Responses proxy."
+        responses_tool_calling = $true
+        supported_tools = @("repo_list_files", "repo_read_file", "repo_search_text", "repo_apply_patch", "repo_write_file", "repo_delete_file")
+        unsupported_responses_features = @("stream=true")
+        stream_supported = $false
+        shell_supported = $false
+        note = "Runtime supports approved native repository tools through execution tasks. Shell command execution remains disabled."
     }
     try {
         $checks.direct_api = Test-DeepSeekDirect

@@ -32,6 +32,64 @@
   ],
   "defaults": {
     "execution_agent": "DeepSeek Worker",
-    "review_agent": "Codex Main"
+    "review_agent": "Codex Main",
+    "tool_policy": {
+      "allowed_paths": [
+        "."
+      ],
+      "read_extensions": [
+        "",
+        ".py",
+        ".md",
+        ".toml",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".txt",
+        ".sh",
+        ".ps1",
+        ".go",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".css",
+        ".html",
+        ".rs",
+        ".java"
+      ],
+      "write_extensions": [
+        ".py",
+        ".md",
+        ".toml",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".txt",
+        ".sh",
+        ".ps1",
+        ".go",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".css",
+        ".html",
+        ".rs",
+        ".java"
+      ],
+      "allowed_tools": [
+        "repo_list_files",
+        "repo_read_file",
+        "repo_search_text",
+        "repo_apply_patch",
+        "repo_write_file"
+      ],
+      "max_file_read_bytes": 262144,
+      "max_search_results": 50,
+      "max_tool_steps": 12,
+      "allow_full_rewrite": false,
+      "allow_delete": false
+    }
   }
 }

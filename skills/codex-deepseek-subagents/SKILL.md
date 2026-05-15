@@ -67,7 +67,12 @@ The local scheduler runtime provides:
 - `POST /v1/tasks/{task_id}/retry`
 - `POST /v1/responses`
 
-`/v1/responses` remains a smoke-test endpoint. It does not implement `stream=true`, `tools`, or `tool_choice`. In v1, DeepSeek can receive approved text delegation through the scheduler, but it is not a native tool-calling Codex execution agent.
+`/v1/responses` supports two runtime paths:
+
+- Text compatibility mode for legacy smoke tests and explicit text delegation.
+- Approved native repository tools for `execution` tasks that include a `tool_policy` and are referenced through `metadata.scheduler_task_id`.
+
+`stream=true` is still unsupported. Shell command execution remains disabled in v1.
 
 ## Delegation Rules
 
@@ -95,7 +100,7 @@ Default routes:
 - `analysis` and `review` -> `codex_main`
 - `execution` -> `deepseek_worker`
 
-Execution tasks require approval through `/v1/tasks/{task_id}/approve` before the scheduler dispatches them.
+Execution tasks require approval through `/v1/tasks/{task_id}/approve` before the scheduler dispatches them. Native repository reads and writes must stay inside the approved tool policy.
 
 ## Thinking Mode
 
@@ -110,5 +115,5 @@ Never persist or replay raw `reasoning_content`. Logs should keep token metadata
 ## Maintenance
 
 - `update` should migrate older shim-only installs to the scheduler runtime.
-- `doctor` should report config presence, registry summary, text-delegation readiness, native tool-agent readiness, direct API health, and runtime health separately.
+- `doctor` should report config presence, registry summary, text-delegation readiness, native tool-agent readiness, supported tools, direct API health, and runtime health separately.
 - `export-shareable` should exclude local secrets, logs, backups, and runtime state.
