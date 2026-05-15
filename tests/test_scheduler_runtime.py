@@ -127,6 +127,12 @@ class SchedulerRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must not contain deepseek_api_key"):
             SCHEDULER.validate_user_config({"deepseek_api_key": "sk-test"})
 
+    def test_user_config_accepts_utf8_bom(self):
+        text = self.user_config_path.read_text(encoding="utf-8")
+        self.user_config_path.write_text(text, encoding="utf-8-sig")
+        state = self.build_state()
+        self.assertEqual(state.config["defaults"]["execution_agent"], "DeepSeek Worker")
+
     def test_create_task_waits_for_approval(self):
         state = self.build_state()
         task = state.create_task({
@@ -152,6 +158,41 @@ class SchedulerRuntimeTests(unittest.TestCase):
         self.assertEqual(retried["attempt"], 1)
         self.assertEqual(retried["status"], "awaiting_approval")
 
+    def test_failed_approval_dispatch_persists_approved_and_failed_state(self):
+        state = self.build_state()
+        task = state.create_task({
+            "type": "execution",
+            "description": "Task that will fail",
+            "approval_scope": {"summary": "approved failure test"},
+        })
+        original = SCHEDULER.invoke_deepseek_chat
+        snapshots = []
+        original_save = state.save_task_store
+
+        def capture_save():
+            original_save()
+            snapshots.append(json.loads(self.task_store_path.read_text(encoding="utf-8")))
+
+        def fail_chat(_task, mode):
+            raise RuntimeError("planned failure")
+
+        try:
+            state.save_task_store = capture_save
+            SCHEDULER.invoke_deepseek_chat = fail_chat
+            approved = state.approve_task(task["task_id"], {"approval_token": "approved-by-user"})
+        finally:
+            SCHEDULER.invoke_deepseek_chat = original
+
+        self.assertEqual(approved["status"], "failed")
+        self.assertTrue(approved["approval_scope"]["approval_token_present"])
+        statuses = [snapshot["tasks"][0]["status"] for snapshot in snapshots]
+        self.assertIn("awaiting_approval", statuses)
+        self.assertIn("running", statuses)
+        self.assertEqual(statuses[-1], "failed")
+        persisted = json.loads(self.task_store_path.read_text(encoding="utf-8"))["tasks"][0]
+        self.assertEqual(persisted["status"], "failed")
+        self.assertEqual(persisted["result"]["error_category"], "unknown_error")
+
     def test_runtime_endpoints_and_logs(self):
         state = self.build_state()
         handler = SCHEDULER.build_handler(state)
@@ -161,6 +202,8 @@ class SchedulerRuntimeTests(unittest.TestCase):
             with urllib.request.urlopen(f"{base}/healthz", timeout=2) as res:
                 health = json.loads(res.read().decode("utf-8"))
             self.assertTrue(health["ok"])
+            self.assertTrue(health["capabilities"]["text_delegate_ready"])
+            self.assertFalse(health["capabilities"]["native_tool_agent_ready"])
 
             req = urllib.request.Request(
                 f"{base}/v1/responses",
@@ -192,6 +235,19 @@ class SchedulerRuntimeTests(unittest.TestCase):
             )
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 urllib.request.urlopen(unsupported_req, timeout=5)
+            self.assertEqual(ctx.exception.code, 400)
+
+            tools_req = urllib.request.Request(
+                f"{base}/v1/responses",
+                data=json.dumps({"tools": [{"type": "function"}], "tool_choice": "auto"}).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer sk-test-placeholder",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(tools_req, timeout=5)
             self.assertEqual(ctx.exception.code, 400)
 
             task_req = urllib.request.Request(
@@ -234,6 +290,7 @@ class SchedulerRuntimeTests(unittest.TestCase):
             with urllib.request.urlopen(f"{base}/v1/agents", timeout=5) as res:
                 agents = json.loads(res.read().decode("utf-8"))
             self.assertEqual(len(agents["data"]), 2)
+            self.assertFalse(agents["capabilities"]["responses_tool_calling"])
 
             log_text = self.log_path.read_text(encoding="utf-8")
             self.assertNotIn("reasoning_content", log_text)

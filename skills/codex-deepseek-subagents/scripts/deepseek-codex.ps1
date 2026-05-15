@@ -173,7 +173,9 @@ function Add-GitIgnoreRules {
         ".codex/deepseek-proxy.stdout.log",
         ".codex/deepseek-proxy.stderr.log",
         ".codex/runtime/task_queue.json",
-        ".codex/backups/"
+        ".codex/backups/",
+        "__pycache__/",
+        "*.py[cod]"
     )
     $existing = if (Test-Path -LiteralPath $gitignore) { Get-Content -LiteralPath $gitignore } else { @() }
     $missing = @($rules | Where-Object { $existing -notcontains $_ })
@@ -412,28 +414,20 @@ function Start-ProcessCleanEnvironment {
         [Parameter(Mandatory = $true)][string]$StandardOutputPath,
         [Parameter(Mandatory = $true)][string]$StandardErrorPath
     )
+    Set-Content -LiteralPath $StandardOutputPath -Value "" -Encoding UTF8
+    Set-Content -LiteralPath $StandardErrorPath -Value "" -Encoding UTF8
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $FilePath
     $psi.Arguments = ($ArgumentList | ForEach-Object { Quote-ProcessArgument $_ }) -join " "
     $psi.WorkingDirectory = $WorkingDirectory
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $true
+    if ($IsWindows -or $PSVersionTable.PSEdition -eq "Desktop") {
+        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    }
 
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $psi
     $null = $process.Start()
-    $process.BeginOutputReadLine()
-    $process.BeginErrorReadLine()
-
-    Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
-        if ($EventArgs.Data) { Add-Content -LiteralPath $Event.MessageData -Value $EventArgs.Data -Encoding UTF8 }
-    } -MessageData $StandardOutputPath | Out-Null
-    Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
-        if ($EventArgs.Data) { Add-Content -LiteralPath $Event.MessageData -Value $EventArgs.Data -Encoding UTF8 }
-    } -MessageData $StandardErrorPath | Out-Null
-
     return $process
 }
 
@@ -589,7 +583,7 @@ function Start-Proxy {
     if (-not $python) { throw "Neither python nor python3 was found." }
     $stdout = Get-ProjectPath ".codex/deepseek-proxy.stdout.log"
     $stderr = Get-ProjectPath ".codex/deepseek-proxy.stderr.log"
-    $process = Start-ProcessCleanEnvironment -FilePath $python.Source -ArgumentList @($runtime, "--port", [string]$Port, "--log-path", ".codex/deepseek-proxy.log.jsonl", "--project-root", ".", "--user-config", "user_config.json", "--task-store", ".codex/runtime/task_queue.json") -WorkingDirectory (Resolve-FullPath $ProjectRoot) -StandardOutputPath $stdout -StandardErrorPath $stderr
+    $process = Start-ProcessCleanEnvironment -FilePath $python.Source -ArgumentList @($runtime, "--port", [string]$Port, "--log-path", ".codex/deepseek-proxy.log.jsonl", "--stdout-log", ".codex/deepseek-proxy.stdout.log", "--stderr-log", ".codex/deepseek-proxy.stderr.log", "--project-root", ".", "--user-config", "user_config.json", "--task-store", ".codex/runtime/task_queue.json") -WorkingDirectory (Resolve-FullPath $ProjectRoot) -StandardOutputPath $stdout -StandardErrorPath $stderr
     Set-Content -LiteralPath $pidFile -Value $process.Id -Encoding ASCII
     Write-Step "Started runtime PID $($process.Id) on port $Port"
 }
@@ -670,6 +664,14 @@ function Invoke-Doctor {
             $checks.user_config_valid = $false
             $checks.user_config_error = $_.Exception.Message
         }
+    }
+    $checks.collaboration_capabilities = [ordered]@{
+        text_delegate_ready = $checks.user_config_valid -and $checks.runtime_entry_exists -and $checks.env_exists
+        native_tool_agent_ready = $false
+        responses_smoke_test = $true
+        responses_tool_calling = $false
+        unsupported_responses_features = @("stream=true", "tools", "tool_choice")
+        note = "v1 supports approved text delegation through the scheduler. Native tool-calling subagent execution requires a future production Responses proxy."
     }
     try {
         $checks.direct_api = Test-DeepSeekDirect

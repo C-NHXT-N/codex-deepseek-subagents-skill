@@ -199,7 +199,7 @@ write_managed_file() {
 add_gitignore_rules() {
   local gitignore
   gitignore="$(project_path ".gitignore")"
-  local rules=(".codex/*.local.*" ".codex/deepseek-proxy.log.jsonl" ".codex/backups/" ".codex/deepseek-proxy.pid" ".codex/deepseek-proxy.stdout.log" ".codex/deepseek-proxy.stderr.log" ".codex/runtime/task_queue.json")
+  local rules=(".codex/*.local.*" ".codex/deepseek-proxy.log.jsonl" ".codex/backups/" ".codex/deepseek-proxy.pid" ".codex/deepseek-proxy.stdout.log" ".codex/deepseek-proxy.stderr.log" ".codex/runtime/task_queue.json" "__pycache__/" "*.py[cod]")
   local missing=()
   for rule in "${rules[@]}"; do
     if [[ ! -f "$gitignore" ]] || ! grep -Fxq "$rule" "$gitignore"; then
@@ -389,10 +389,14 @@ reuse_api_key_from_managed_env() {
 }
 
 doctor() {
-  import_env
   require_command python3
-  sync_port_from_env
-  PORT_ENV="$PORT" PROJECT_ROOT_ENV="$PROJECT_ROOT" python3 - <<'PY'
+  local env_loaded=0
+  if [[ -f "$(project_path ".codex/deepseek.local.env.sh")" ]]; then
+    import_env
+    sync_port_from_env
+    env_loaded=1
+  fi
+  DEEPSEEK_DOCTOR_ENV_LOADED="$env_loaded" PORT_ENV="$PORT" PROJECT_ROOT_ENV="$PROJECT_ROOT" python3 - <<'PY'
 import json, os, signal, urllib.request, urllib.error
 
 root = os.environ["PROJECT_ROOT_ENV"]
@@ -452,13 +456,14 @@ checks = {
     "runtime_entry_exists": runtime_entry_exists,
     "runtime_task_store_exists": runtime_task_store_exists,
     "install_state": install_state,
+    "env_loadable": os.environ.get("DEEPSEEK_DOCTOR_ENV_LOADED") == "1",
     "proxy_pid_exists": pid_exists,
     "proxy_process_alive": process_alive,
     "env_ignored": ".codex/*.local.*" in open(".gitignore", encoding="utf-8").read() if os.path.exists(".gitignore") else False,
 }
 if user_config_exists:
     try:
-        with open("user_config.json", encoding="utf-8") as handle:
+        with open("user_config.json", encoding="utf-8-sig") as handle:
             user_config = json.load(handle)
         checks["user_config_valid"] = (
             "deepseek_api_key" not in user_config
@@ -478,16 +483,34 @@ if user_config_exists:
     except Exception as exc:
         checks["user_config_valid"] = False
         checks["user_config_error"] = str(exc)
-try:
+checks["collaboration_capabilities"] = {
+    "text_delegate_ready": bool(
+        checks.get("user_config_valid")
+        and runtime_entry_exists
+        and env_exists
+    ),
+    "native_tool_agent_ready": False,
+    "responses_smoke_test": True,
+    "responses_tool_calling": False,
+    "unsupported_responses_features": ["stream=true", "tools", "tool_choice"],
+    "note": "v1 supports approved text delegation through the scheduler. Native tool-calling subagent execution requires a future production Responses proxy.",
+}
+if os.environ.get("DEEPSEEK_DOCTOR_ENV_LOADED") != "1":
+    checks["direct_api_error"] = "Missing local env file: .codex/deepseek.local.env.sh. Run install first."
+    checks["direct_api_error_category"] = "not_installed" if install_state == "not_installed" else "api_key_missing_or_invalid"
+    checks["thinking_error"] = checks["direct_api_error"]
+    checks["thinking_error_category"] = checks["direct_api_error_category"]
+else:
+  try:
     body = {"model": os.environ["DEEPSEEK_OPENAI_MODEL"], "messages": [{"role":"user","content":"Reply with exactly: direct-ok"}], "thinking": {"type":"disabled"}, "max_tokens": 32, "stream": False}
     req = urllib.request.Request(os.environ["DEEPSEEK_OPENAI_BASE_URL"].rstrip("/") + "/chat/completions", data=json.dumps(body).encode(), headers={"Authorization":"Bearer "+os.environ["DEEPSEEK_API_KEY"],"Content-Type":"application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=120) as res:
         data = json.loads(res.read().decode())
     checks["direct_api"] = {"ok": "direct-ok" in str(data["choices"][0]["message"].get("content")), "total_tokens": data.get("usage", {}).get("total_tokens")}
-except Exception as exc:
+  except Exception as exc:
     checks["direct_api_error"] = str(exc)
     checks["direct_api_error_category"] = classify_error(exc)
-try:
+  try:
     body = {"model": os.environ["DEEPSEEK_OPENAI_MODEL"], "messages": [{"role":"user","content":"Which number is larger, 9.11 or 9.8? Reply with only the larger number."}], "thinking": {"type":"enabled", "reasoning_effort":"high"}, "max_tokens": 1024, "stream": False}
     req = urllib.request.Request(os.environ["DEEPSEEK_OPENAI_BASE_URL"].rstrip("/") + "/chat/completions", data=json.dumps(body).encode(), headers={"Authorization":"Bearer "+os.environ["DEEPSEEK_API_KEY"],"Content-Type":"application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=120) as res:
@@ -502,7 +525,7 @@ try:
         "reasoning_tokens": details.get("reasoning_tokens"),
         "total_tokens": usage.get("total_tokens"),
     }
-except Exception as exc:
+  except Exception as exc:
     checks["thinking_error"] = str(exc)
     checks["thinking_error_category"] = classify_error(exc)
 try:
@@ -630,7 +653,7 @@ PY
     fi
   fi
   if [[ "$DRY_RUN" == "1" ]]; then step "Would start scheduler runtime on port $PORT"; return; fi
-  (cd "$PROJECT_ROOT" && nohup python3 .codex/runtime/deepseek_scheduler.py --port "$PORT" --log-path .codex/deepseek-proxy.log.jsonl --project-root . --user-config user_config.json --task-store .codex/runtime/task_queue.json >.codex/deepseek-proxy.stdout.log 2>.codex/deepseek-proxy.stderr.log & echo $! > .codex/deepseek-proxy.pid)
+  (cd "$PROJECT_ROOT" && nohup python3 .codex/runtime/deepseek_scheduler.py --port "$PORT" --log-path .codex/deepseek-proxy.log.jsonl --stdout-log .codex/deepseek-proxy.stdout.log --stderr-log .codex/deepseek-proxy.stderr.log --project-root . --user-config user_config.json --task-store .codex/runtime/task_queue.json >/dev/null 2>&1 & echo $! > .codex/deepseek-proxy.pid)
   step "Started runtime PID $(cat "$pid_file") on port $PORT"
 }
 

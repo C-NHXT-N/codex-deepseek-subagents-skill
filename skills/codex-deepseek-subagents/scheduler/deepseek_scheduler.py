@@ -3,6 +3,7 @@ import argparse
 import copy
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -96,7 +97,7 @@ class RuntimeState:
     def load_user_config(self):
         if not self.user_config_path.exists():
             raise RuntimeError(f"Missing user config: {self.user_config_path}")
-        with self.user_config_path.open("r", encoding="utf-8") as handle:
+        with self.user_config_path.open("r", encoding="utf-8-sig") as handle:
             config = json.load(handle)
         return validate_user_config(config)
 
@@ -105,7 +106,7 @@ class RuntimeState:
             self.task_store_path.parent.mkdir(parents=True, exist_ok=True)
             self.task_store_path.write_text(json.dumps(DEFAULT_TASK_STORE, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             return {"tasks": []}
-        with self.task_store_path.open("r", encoding="utf-8") as handle:
+        with self.task_store_path.open("r", encoding="utf-8-sig") as handle:
             data = json.load(handle)
         if not isinstance(data, dict) or not isinstance(data.get("tasks"), list):
             raise RuntimeError(f"Invalid task store format: {self.task_store_path}")
@@ -131,6 +132,7 @@ class RuntimeState:
             "task_store_path": str(self.task_store_path),
             "agents": len([agent for agent in self.config["connected_agents"] if agent.get("enabled", True)]),
             "tasks": len(self.task_store["tasks"]),
+            "capabilities": runtime_capabilities(),
         }
 
     def create_task(self, payload):
@@ -215,6 +217,7 @@ class RuntimeState:
             "task_type": task["type"],
             "assigned_agent": task["assigned_agent"],
         })
+        self.save_task_store()
         self.dispatch_execution_task(task)
         self.save_task_store()
         return task
@@ -250,6 +253,7 @@ class RuntimeState:
         task["status"] = "running"
         task["timestamps"]["started_at"] = utc_now()
         task["timestamps"]["updated_at"] = utc_now()
+        self.save_task_store()
         agent = self.agent_index[task["assigned_agent"]]
         mode = str((agent.get("defaults") or {}).get("mode") or "pro-thinking")
         try:
@@ -284,6 +288,7 @@ class RuntimeState:
                 "model": result.get("model"),
                 "model_label": result.get("model_label"),
             })
+            self.save_task_store()
         except Exception as exc:
             task["status"] = "failed"
             task["result"] = {
@@ -302,6 +307,7 @@ class RuntimeState:
                 "error": str(exc),
                 "error_category": classify_error(exc),
             })
+            self.save_task_store()
 
 
 def normalize_approval_scope(scope):
@@ -401,6 +407,17 @@ def initial_status_for_agent(agent):
     if agent["kind"] == "codex_main":
         return "waiting_for_codex"
     return "awaiting_approval"
+
+
+def runtime_capabilities():
+    return {
+        "text_delegate_ready": True,
+        "native_tool_agent_ready": False,
+        "responses_smoke_test": True,
+        "responses_tool_calling": False,
+        "unsupported_responses_features": ["stream=true", "tools", "tool_choice"],
+        "native_tool_agent_note": "v1 supports approved text delegation only; production Responses tool-calling proxy is not implemented.",
+    }
 
 
 def build_task_prompt(task):
@@ -529,6 +546,7 @@ def build_handler(state):
                 write_json(self, 200, {
                     "data": list(state.agent_index.values()),
                     "defaults": state.config["defaults"],
+                    "capabilities": runtime_capabilities(),
                 })
                 return
             if self.path.startswith("/v1/tasks/"):
@@ -684,6 +702,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--log-path", default=".codex/deepseek-proxy.log.jsonl")
+    parser.add_argument("--stdout-log", default="")
+    parser.add_argument("--stderr-log", default="")
     parser.add_argument("--project-root", default=".")
     parser.add_argument("--user-config", default="user_config.json")
     parser.add_argument("--task-store", default=".codex/runtime/task_queue.json")
@@ -691,6 +711,14 @@ def main():
 
     project_root = Path(args.project_root).resolve()
     os.chdir(project_root)
+    if args.stdout_log:
+        stdout_path = Path(args.stdout_log)
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        sys.stdout = stdout_path.open("a", encoding="utf-8", buffering=1)
+    if args.stderr_log:
+        stderr_path = Path(args.stderr_log)
+        stderr_path.parent.mkdir(parents=True, exist_ok=True)
+        sys.stderr = stderr_path.open("a", encoding="utf-8", buffering=1)
     state = RuntimeState(
         project_root=project_root,
         log_path=str(Path(args.log_path)),

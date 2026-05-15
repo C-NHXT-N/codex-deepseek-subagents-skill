@@ -72,7 +72,7 @@ The local scheduler runtime is a single Python process. It serves:
 - `POST /v1/tasks/{task_id}/retry`
 - `POST /v1/responses`
 
-`/v1/responses` is still a smoke-test compatibility endpoint. `stream=true`, `tools`, and `tool_choice` return `400` with an explicit message instead of being silently ignored.
+`/v1/responses` is still a smoke-test compatibility endpoint. `stream=true`, `tools`, and `tool_choice` return `400` with an explicit message instead of being silently ignored. In v1, this means the scheduler supports approved text delegation to DeepSeek, not native Codex tool-calling execution by DeepSeek.
 
 ## Agent Registry
 
@@ -94,7 +94,7 @@ Execution tasks must be approved before the scheduler dispatches them.
 - `install`: create or refresh the project-local runtime, config, env files, tests, and gitignore rules.
 - `update`: migrate older shim-only installs to the scheduler runtime while preserving managed local secrets.
 - `uninstall`: remove managed project files and runtime state.
-- `doctor`: validate config presence, user config shape, registry summary, direct API health, thinking mode, and runtime health.
+- `doctor`: validate config presence, user config shape, registry summary, collaboration capability boundaries, direct API health, thinking mode, and runtime health.
 - `desktop-doctor`: same checks as `doctor`.
 - `delegate`: explicit DeepSeek fallback when Codex native subagent registration is unavailable.
 - `start-runtime`, `stop-runtime`: start or stop the local scheduler.
@@ -115,6 +115,15 @@ This may send repository content to DeepSeek or the configured proxy. Confirm be
 ```
 
 Do not persist or replay raw `reasoning_content`. Logs record task metadata, status, token usage, and execution summaries only.
+
+## Capability Boundary
+
+`doctor` reports two separate readiness flags:
+
+- `text_delegate_ready`: approved text delegation through the scheduler can be used.
+- `native_tool_agent_ready`: always `false` in v1 because the smoke-test Responses endpoint does not implement tool-calling.
+
+If you need DeepSeek to directly read, edit, and verify files as a native Codex execution agent, replace the smoke-test `/v1/responses` adapter with a production Responses-compatible proxy that implements tools.
 
 ## Development
 
