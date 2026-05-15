@@ -1,10 +1,6 @@
+﻿# Managed by codex-deepseek-subagents
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\deepseek.local.env.ps1"
-
-$headers = @{
-    Authorization = "Bearer $env:DEEPSEEK_API_KEY"
-    "Content-Type" = "application/json"
-}
 
 function Invoke-DeepSeekProbe {
     param(
@@ -20,6 +16,7 @@ function Invoke-DeepSeekProbe {
         @{ type = "disabled" }
     }
 
+    Add-Type -AssemblyName System.Net.Http
     $body = @{
         model = "deepseek-v4-pro"
         messages = @(
@@ -28,15 +25,31 @@ function Invoke-DeepSeekProbe {
         thinking = $thinking
         max_tokens = $MaxTokens
         stream = $false
-    } | ConvertTo-Json -Depth 8
+    } | ConvertTo-Json -Depth 8 -Compress
 
-    $response = Invoke-RestMethod -Method Post -Uri "$env:DEEPSEEK_OPENAI_BASE_URL/chat/completions" -Headers $headers -Body $body
+    $client = [System.Net.Http.HttpClient]::new()
+    try {
+        $client.Timeout = [TimeSpan]::FromSeconds(180)
+        $client.DefaultRequestHeaders.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", $env:DEEPSEEK_API_KEY)
+        $content = [System.Net.Http.StringContent]::new($body, [System.Text.Encoding]::UTF8, "application/json")
+        $result = $client.PostAsync("$($env:DEEPSEEK_OPENAI_BASE_URL.TrimEnd('/'))/chat/completions", $content).GetAwaiter().GetResult()
+        $text = $result.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if (-not $result.IsSuccessStatusCode) {
+            throw "DeepSeek HTTP $([int]$result.StatusCode): $text"
+        }
+        $response = $text | ConvertFrom-Json
+    }
+    finally {
+        $client.Dispose()
+    }
     $message = $response.choices[0].message
+    $modelLabel = if ($ThinkingType -eq "enabled") { "$($response.model)(thinking)" } else { [string]$response.model }
 
     [pscustomobject]@{
         thinking_type = $ThinkingType
         reasoning_effort = if ($ThinkingType -eq "enabled") { $ReasoningEffort } else { $null }
         model = $response.model
+        model_label = $modelLabel
         finish_reason = $response.choices[0].finish_reason
         content = $message.content
         has_reasoning_content = [bool]$message.reasoning_content
@@ -52,3 +65,4 @@ function Invoke-DeepSeekProbe {
     (Invoke-DeepSeekProbe -ThinkingType "disabled")
     (Invoke-DeepSeekProbe -ThinkingType "enabled" -ReasoningEffort "high" -MaxTokens 1024)
 ) | ConvertTo-Json -Depth 8
+

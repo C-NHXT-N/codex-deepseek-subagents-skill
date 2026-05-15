@@ -1,6 +1,6 @@
 # Managed by codex-deepseek-subagents
 name = "deepseek_worker"
-description = "Implementation-focused DeepSeek worker for explicitly delegated Codex tasks through the local Responses-compatible proxy."
+description = "Implementation-focused DeepSeek worker for explicitly delegated Codex tasks through the local scheduler runtime."
 model_provider = "deepseek_responses"
 model = "__MODEL_TOML__"
 sandbox_mode = "workspace-write"
@@ -10,4 +10,3 @@ Do not revert unrelated changes. Adapt to existing edits.
 Use the minimum context needed: inspect only the files or paths named in the assignment unless the main agent explicitly authorizes broader exploration.
 Do not print or persist hidden reasoning. Report changed files, commands run, verification results, token/cost observations if available, and blockers.
 """
-

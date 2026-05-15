@@ -1,3 +1,4 @@
+﻿# Managed by codex-deepseek-subagents
 param(
     [int]$Port = 4000,
     [string]$LogPath = ".codex/deepseek-proxy.log.jsonl"
@@ -67,11 +68,29 @@ function Get-WebExceptionBody {
     }
 }
 
+function Invoke-DeepSeekChat {
+    param([hashtable]$ChatBody)
+    Add-Type -AssemblyName System.Net.Http
+    $json = $ChatBody | ConvertTo-Json -Depth 20 -Compress
+    $client = [System.Net.Http.HttpClient]::new()
+    try {
+        $client.Timeout = [TimeSpan]::FromSeconds(180)
+        $client.DefaultRequestHeaders.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", $env:DEEPSEEK_API_KEY)
+        $content = [System.Net.Http.StringContent]::new($json, [System.Text.Encoding]::UTF8, "application/json")
+        $result = $client.PostAsync("$($baseUrl.TrimEnd('/'))/chat/completions", $content).GetAwaiter().GetResult()
+        $text = $result.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if (-not $result.IsSuccessStatusCode) {
+            throw "DeepSeek HTTP $([int]$result.StatusCode): $text"
+        }
+        return $text | ConvertFrom-Json
+    }
+    finally {
+        $client.Dispose()
+    }
+}
+
 function Convert-ResponseInputToMessages {
-    param(
-        [Parameter(Mandatory = $false)]
-        $ResponseInput
-    )
+    param([Parameter(Mandatory = $false)]$ResponseInput)
     $messages = @()
 
     if ($ResponseInput -is [string]) {
@@ -127,6 +146,15 @@ try {
                 continue
             }
 
+            $expectedProxyKey = $env:DEEPSEEK_PROXY_API_KEY
+            if ($expectedProxyKey) {
+                $authorization = $request.Headers["Authorization"]
+                if ($authorization -ne "Bearer $expectedProxyKey") {
+                    Write-JsonResponse $response 401 @{ error = @{ message = "Invalid proxy authorization." } }
+                    continue
+                }
+            }
+
             if ($request.HttpMethod -ne "POST" -or $request.Url.AbsolutePath -ne "/v1/responses") {
                 Write-JsonResponse $response 404 @{ error = @{ message = "Only POST /v1/responses is implemented by this smoke-test shim." } }
                 continue
@@ -140,13 +168,15 @@ try {
                 $messages = @(@{ role = "user"; content = "Respond with exactly: ok" })
             }
 
-            $effort = if ($payload.metadata -and $payload.metadata.deepseek_reasoning_effort) { [string]$payload.metadata.deepseek_reasoning_effort } else { "disabled" }
+            $defaultEffort = if ($env:DEEPSEEK_THINKING_DEFAULT) { $env:DEEPSEEK_THINKING_DEFAULT } else { "disabled" }
+            $effort = if ($payload.metadata -and $payload.metadata.deepseek_reasoning_effort) { [string]$payload.metadata.deepseek_reasoning_effort } else { $defaultEffort }
             $thinking = if ($effort -eq "disabled" -or $effort -eq "none" -or $effort -eq "low-cost") {
                 @{ type = "disabled" }
             }
             else {
                 @{ type = "enabled"; reasoning_effort = $effort }
             }
+            $modelLabel = if ($thinking.type -eq "enabled") { "$model(thinking)" } else { $model }
 
             $messageArray = @($messages)
             $chatBody = @{
@@ -157,29 +187,23 @@ try {
                 stream = $false
             }
 
-            $headers = @{
-                Authorization = "Bearer $env:DEEPSEEK_API_KEY"
-                "Content-Type" = "application/json"
-            }
-
-            $chatJson = $chatBody | ConvertTo-Json -Depth 20
             try {
-                $chatResponse = Invoke-RestMethod -Method Post -Uri "$baseUrl/chat/completions" -Headers $headers -Body $chatJson
+                $chatResponse = Invoke-DeepSeekChat -ChatBody $chatBody
             }
             catch {
-                $upstreamBody = Get-WebExceptionBody $_.Exception
                 Append-ProxyLog @{
                     ts = (Get-Date).ToUniversalTime().ToString("o")
                     path = $request.Url.AbsolutePath
                     upstream_error = $_.Exception.Message
-                    upstream_body = $upstreamBody
                     model = $model
+                    model_label = $modelLabel
                     thinking_type = $thinking.type
                     message_count = $messageArray.Count
                     request_input_chars = ($messageArray | ForEach-Object { $_.content.Length } | Measure-Object -Sum).Sum
                 }
                 throw
             }
+
             $message = $chatResponse.choices[0].message
             $content = if ($message.content) { [string]$message.content } else { "" }
             $reasoningChars = if ($message.reasoning_content) { ([string]$message.reasoning_content).Length } else { 0 }
@@ -225,6 +249,7 @@ try {
                 ts = (Get-Date).ToUniversalTime().ToString("o")
                 path = $request.Url.AbsolutePath
                 model = $model
+                model_label = $modelLabel
                 thinking_type = $thinking.type
                 reasoning_effort = if ($thinking.reasoning_effort) { $thinking.reasoning_effort } else { $null }
                 request_input_chars = ($messageArray | ForEach-Object { $_.content.Length } | Measure-Object -Sum).Sum
@@ -251,3 +276,4 @@ try {
 finally {
     $listener.Stop()
 }
+

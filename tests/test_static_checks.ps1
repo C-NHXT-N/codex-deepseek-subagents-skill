@@ -45,12 +45,15 @@ try {
         -Port 5001
 
     $required = @(
+        "user_config.json",
         ".codex/config.toml",
         ".codex/agents/deepseek-worker.toml",
         ".codex/deepseek.local.env.ps1",
         ".codex/deepseek.local.env.sh",
         ".codex/deepseek-responses-shim.ps1",
         ".codex/deepseek_responses_shim.py",
+        ".codex/runtime/deepseek_scheduler.py",
+        ".codex/runtime/task_queue.json",
         ".codex/test-deepseek-direct.ps1",
         ".codex/test-deepseek-direct.sh",
         ".codex/test-responses-proxy.ps1",
@@ -75,11 +78,20 @@ try {
         }
     }
 
+    $userConfig = Get-Content -Raw (Join-Path $tmp.FullName "user_config.json") | ConvertFrom-Json
+    if (@($userConfig.PSObject.Properties.Name) -contains "deepseek_api_key") {
+        throw "user_config.json must not contain deepseek_api_key"
+    }
+    if ($userConfig.defaults.execution_agent -ne "DeepSeek Worker") {
+        throw "user_config.json did not contain expected execution_agent default"
+    }
+
     $runtimeFiles = @(
         ".codex/deepseek-proxy.log.jsonl",
         ".codex/deepseek-proxy.pid",
         ".codex/deepseek-proxy.stdout.log",
-        ".codex/deepseek-proxy.stderr.log"
+        ".codex/deepseek-proxy.stderr.log",
+        ".codex/runtime/task_queue.json"
     )
     foreach ($rel in $runtimeFiles) {
         Set-Content -LiteralPath (Join-Path $tmp.FullName $rel) -Value "runtime" -Encoding UTF8

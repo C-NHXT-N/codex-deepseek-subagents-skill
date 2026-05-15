@@ -17,12 +17,15 @@ bash "$script" install \
   --port 5001
 
 required=(
+  "user_config.json"
   ".codex/config.toml"
   ".codex/agents/deepseek-worker.toml"
   ".codex/deepseek.local.env.sh"
   ".codex/deepseek.local.env.ps1"
   ".codex/deepseek_responses_shim.py"
   ".codex/deepseek-responses-shim.ps1"
+  ".codex/runtime/deepseek_scheduler.py"
+  ".codex/runtime/task_queue.json"
   ".codex/test-deepseek-direct.sh"
   ".codex/test-deepseek-direct.ps1"
   ".codex/test-responses-proxy.sh"
@@ -32,6 +35,14 @@ required=(
 for rel in "${required[@]}"; do
   test -f "$tmp/$rel"
 done
+
+python3 - <<'PY' "$tmp/user_config.json"
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert "deepseek_api_key" not in data
+assert data["defaults"]["execution_agent"] == "DeepSeek Worker"
+assert len(data["connected_agents"]) == 2
+PY
 
 grep -q "127.0.0.1:5001" "$tmp/.codex/config.toml"
 grep -q "127.0.0.1:5001" "$tmp/.codex/deepseek.local.env.sh"

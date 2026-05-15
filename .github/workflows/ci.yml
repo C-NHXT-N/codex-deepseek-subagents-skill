@@ -17,3 +17,9 @@ jobs:
       - uses: actions/checkout@v4
       - shell: pwsh
         run: ./tests/test_static_checks.ps1
+
+  python-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s tests -p "test_scheduler_runtime.py"

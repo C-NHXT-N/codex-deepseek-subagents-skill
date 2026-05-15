@@ -28,6 +28,7 @@ MANAGED_MARKER="# Managed by codex-deepseek-subagents"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEMPLATE_ROOT="$SKILL_ROOT/templates"
+SCHEDULER_ROOT="$SKILL_ROOT/scheduler"
 
 usage() {
   cat <<'EOF'
@@ -35,7 +36,8 @@ Usage: deepseek-codex.sh <command> [options]
 
 Commands:
   install, update, uninstall, doctor, desktop-doctor, delegate,
-  start-proxy, stop-proxy, test-proxy, usage, redact, export-shareable
+  start-proxy, stop-proxy, test-proxy, start-runtime, stop-runtime,
+  usage, redact, export-shareable
 
 Options:
   --project-root PATH
@@ -128,6 +130,19 @@ expand_template() {
     "$TEMPLATE_ROOT/$template"
 }
 
+expand_scheduler_source() {
+  local relative="$1"
+  sed \
+    -e "s|__API_KEY_SH__|$(sq "$API_KEY")|g" \
+    -e "s|__BASE_URL_SH__|$(sq "$BASE_URL")|g" \
+    -e "s|__ANTHROPIC_BASE_URL_SH__|$(sq "$ANTHROPIC_BASE_URL")|g" \
+    -e "s|__MODEL_SH__|$(sq "$MODEL")|g" \
+    -e "s|__FAST_MODEL_SH__|$(sq "$FAST_MODEL")|g" \
+    -e "s|__THINKING_DEFAULT_SH__|$(sq "$THINKING_DEFAULT")|g" \
+    -e "s|__PORT__|$PORT|g" \
+    "$SCHEDULER_ROOT/$relative"
+}
+
 is_managed_file() {
   [[ -f "$1" ]] && head -n 3 "$1" 2>/dev/null | grep -Fxq "$MANAGED_MARKER"
 }
@@ -184,7 +199,7 @@ write_managed_file() {
 add_gitignore_rules() {
   local gitignore
   gitignore="$(project_path ".gitignore")"
-  local rules=(".codex/*.local.*" ".codex/deepseek-proxy.log.jsonl" ".codex/backups/" ".codex/deepseek-proxy.pid" ".codex/deepseek-proxy.stdout.log" ".codex/deepseek-proxy.stderr.log")
+  local rules=(".codex/*.local.*" ".codex/deepseek-proxy.log.jsonl" ".codex/backups/" ".codex/deepseek-proxy.pid" ".codex/deepseek-proxy.stdout.log" ".codex/deepseek-proxy.stderr.log" ".codex/runtime/task_queue.json")
   local missing=()
   for rule in "${rules[@]}"; do
     if [[ ! -f "$gitignore" ]] || ! grep -Fxq "$rule" "$gitignore"; then
@@ -216,19 +231,31 @@ install_or_update() {
     reuse_api_key_from_managed_env "$existing" || true
     [[ -z "$API_KEY" ]] && { echo "update requires --api-key when no existing managed key can be reused. Pass --api-key explicitly." >&2; exit 1; }
   fi
+  write_managed_file "$(project_path "user_config.json")" "$(expand_template "user_config.json.tpl")"
   write_managed_file "$(project_path ".codex/config.toml")" "$(expand_template "config.toml.tpl")"
   write_managed_file "$(project_path ".codex/agents/deepseek-worker.toml")" "$(expand_template "deepseek-worker.toml.tpl")"
   write_managed_file "$(project_path ".codex/deepseek.local.env.sh")" "$(expand_template "deepseek.local.env.sh.tpl")" 1
   write_managed_file "$(project_path ".codex/deepseek.local.env.ps1")" "$(powershell_template_or_comment)" 1
   write_managed_file "$(project_path ".codex/deepseek-responses-shim.ps1")" "$(powershell_shim_template_or_comment)"
   write_managed_file "$(project_path ".codex/deepseek_responses_shim.py")" "$(expand_template "deepseek_responses_shim.py.tpl")"
+  write_managed_file "$(project_path ".codex/runtime/deepseek_scheduler.py")" "$(expand_scheduler_source "deepseek_scheduler.py")"
   write_managed_file "$(project_path ".codex/test-deepseek-direct.sh")" "$(expand_template "test-deepseek-direct.sh.tpl")"
   write_managed_file "$(project_path ".codex/test-responses-proxy.sh")" "$(expand_template "test-responses-proxy.sh.tpl")"
   write_managed_file "$(project_path ".codex/test-deepseek-direct.ps1")" "$(powershell_direct_test_template_or_comment)"
   write_managed_file "$(project_path ".codex/test-responses-proxy.ps1")" "$(powershell_proxy_test_template_or_comment)"
+  local task_store
+  task_store="$(project_path ".codex/runtime/task_queue.json")"
+  if [[ ! -e "$task_store" || "$FORCE" == "1" ]]; then
+    ensure_dir "$(dirname "$task_store")"
+    if [[ "$DRY_RUN" == "1" ]]; then
+      step "Would initialize runtime task store: $task_store"
+    else
+      printf '{\n  "tasks": []\n}\n' > "$task_store"
+    fi
+  fi
   add_gitignore_rules
   step "$([[ "$is_update" == "1" ]] && echo Update || echo Install) complete."
-  step "Post-install check: keep only one codex-deepseek-subagents skill under CODEX_HOME/skills, then run doctor, start-proxy, and test-proxy."
+  step "Post-install check: keep only one codex-deepseek-subagents skill under CODEX_HOME/skills, then run doctor, start-runtime, and test-proxy."
 }
 
 powershell_template_or_comment() {
@@ -287,19 +314,21 @@ remove_managed_path() {
 
 uninstall_project() {
   local paths=(
+    "user_config.json"
     ".codex/config.toml"
     ".codex/agents/deepseek-worker.toml"
     ".codex/deepseek.local.env.sh"
     ".codex/deepseek.local.env.ps1"
     ".codex/deepseek-responses-shim.ps1"
     ".codex/deepseek_responses_shim.py"
+    ".codex/runtime/deepseek_scheduler.py"
     ".codex/test-deepseek-direct.sh"
     ".codex/test-responses-proxy.sh"
     ".codex/test-deepseek-direct.ps1"
     ".codex/test-responses-proxy.ps1"
   )
   for rel in "${paths[@]}"; do remove_managed_path "$(project_path "$rel")"; done
-  for rel in ".codex/deepseek-proxy.log.jsonl" ".codex/deepseek-proxy.pid" ".codex/deepseek-proxy.stdout.log" ".codex/deepseek-proxy.stderr.log"; do
+  for rel in ".codex/deepseek-proxy.log.jsonl" ".codex/deepseek-proxy.pid" ".codex/deepseek-proxy.stdout.log" ".codex/deepseek-proxy.stderr.log" ".codex/runtime/task_queue.json"; do
     local path
     path="$(project_path "$rel")"
     [[ -e "$path" ]] || continue
@@ -384,16 +413,21 @@ def classify_error(message):
         return "network_or_api_error"
     return "unknown_error"
 
+user_config_exists = exists("user_config.json")
 config_exists = exists(".codex/config.toml")
 worker_exists = exists(".codex/agents/deepseek-worker.toml")
 env_exists = exists(".codex/deepseek.local.env.sh")
-python_shim_exists = exists(".codex/deepseek_responses_shim.py")
-if not any((config_exists, worker_exists, env_exists, python_shim_exists)):
+legacy_shim_exists = exists(".codex/deepseek_responses_shim.py")
+runtime_entry_exists = exists(".codex/runtime/deepseek_scheduler.py")
+runtime_task_store_exists = exists(".codex/runtime/task_queue.json")
+if not any((user_config_exists, config_exists, worker_exists, env_exists, legacy_shim_exists, runtime_entry_exists)):
     install_state = "not_installed"
-elif all((config_exists, worker_exists, env_exists, python_shim_exists)):
+elif all((user_config_exists, config_exists, worker_exists, env_exists, runtime_entry_exists)):
     install_state = "ok"
-elif not python_shim_exists:
-    install_state = "stale_missing_python_shim"
+elif legacy_shim_exists and not runtime_entry_exists:
+    install_state = "stale_legacy_runtime"
+elif not runtime_entry_exists:
+    install_state = "stale_missing_runtime"
 else:
     install_state = "incomplete"
 
@@ -410,15 +444,40 @@ if pid_exists:
 
 checks = {
     "project_root": root,
+    "user_config_exists": user_config_exists,
     "config_exists": config_exists,
     "worker_exists": worker_exists,
     "env_exists": env_exists,
-    "python_shim_exists": python_shim_exists,
+    "legacy_shim_exists": legacy_shim_exists,
+    "runtime_entry_exists": runtime_entry_exists,
+    "runtime_task_store_exists": runtime_task_store_exists,
     "install_state": install_state,
     "proxy_pid_exists": pid_exists,
     "proxy_process_alive": process_alive,
     "env_ignored": ".codex/*.local.*" in open(".gitignore", encoding="utf-8").read() if os.path.exists(".gitignore") else False,
 }
+if user_config_exists:
+    try:
+        with open("user_config.json", encoding="utf-8") as handle:
+            user_config = json.load(handle)
+        checks["user_config_valid"] = (
+            "deepseek_api_key" not in user_config
+            and isinstance(user_config.get("runtime"), dict)
+            and isinstance(user_config.get("connected_agents"), list)
+            and isinstance(user_config.get("defaults"), dict)
+        )
+        checks["agent_registry_summary"] = [
+            {
+                "name": agent.get("name"),
+                "kind": agent.get("kind"),
+                "endpoint": agent.get("endpoint"),
+            }
+            for agent in user_config.get("connected_agents", [])
+            if agent.get("enabled", True)
+        ]
+    except Exception as exc:
+        checks["user_config_valid"] = False
+        checks["user_config_error"] = str(exc)
 try:
     body = {"model": os.environ["DEEPSEEK_OPENAI_MODEL"], "messages": [{"role":"user","content":"Reply with exactly: direct-ok"}], "thinking": {"type":"disabled"}, "max_tokens": 32, "stream": False}
     req = urllib.request.Request(os.environ["DEEPSEEK_OPENAI_BASE_URL"].rstrip("/") + "/chat/completions", data=json.dumps(body).encode(), headers={"Authorization":"Bearer "+os.environ["DEEPSEEK_API_KEY"],"Content-Type":"application/json"}, method="POST")
@@ -447,18 +506,18 @@ except Exception as exc:
     checks["thinking_error"] = str(exc)
     checks["thinking_error_category"] = classify_error(exc)
 try:
-    with urllib.request.urlopen("http://127.0.0.1:" + os.environ["PORT_ENV"] + "/health", timeout=2) as res:
-        checks["proxy_health"] = json.loads(res.read().decode())
+    with urllib.request.urlopen("http://127.0.0.1:" + os.environ["PORT_ENV"] + "/healthz", timeout=2) as res:
+        checks["runtime_health"] = json.loads(res.read().decode())
 except Exception as exc:
-    if not python_shim_exists:
-        checks["proxy_health_error"] = "Python proxy shim is missing. This install is stale or incomplete; run update first."
-        checks["proxy_health_error_category"] = "stale_install"
+    if not runtime_entry_exists:
+        checks["runtime_health_error"] = "Runtime entrypoint is missing. This install is stale or incomplete; run update first."
+        checks["runtime_health_error_category"] = "stale_install"
     elif pid_exists and process_alive:
-        checks["proxy_health_error"] = "Proxy process exists but did not answer /health on port " + os.environ["PORT_ENV"] + "."
-        checks["proxy_health_error_category"] = "proxy_unhealthy"
+        checks["runtime_health_error"] = "Runtime process exists but did not answer /healthz on port " + os.environ["PORT_ENV"] + "."
+        checks["runtime_health_error_category"] = "proxy_unhealthy"
     else:
-        checks["proxy_health_error"] = "Proxy is not running on port " + os.environ["PORT_ENV"] + ". Run start-proxy."
-        checks["proxy_health_error_category"] = "proxy_not_running"
+        checks["runtime_health_error"] = "Runtime is not running on port " + os.environ["PORT_ENV"] + ". Run start-runtime."
+        checks["runtime_health_error_category"] = "proxy_not_running"
 checks["desktop_native_subagent"] = {
     "configured_agent": "deepseek_worker",
     "worker_config_exists": checks["worker_exists"],
@@ -550,39 +609,39 @@ start_proxy() {
   import_env
   require_command python3
   sync_port_from_env
-  local shim
-  shim="$(project_path ".codex/deepseek_responses_shim.py")"
-  [[ -f "$shim" ]] || { echo "Python proxy shim is missing: $shim. This install is stale or incomplete; run update first." >&2; exit 1; }
+  local runtime
+  runtime="$(project_path ".codex/runtime/deepseek_scheduler.py")"
+  [[ -f "$runtime" ]] || { echo "Runtime entrypoint is missing: $runtime. This install is stale or incomplete; run update first." >&2; exit 1; }
   local pid_file
   pid_file="$(project_path ".codex/deepseek-proxy.pid")"
   if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
     if python3 - <<PY >/dev/null 2>&1
 import urllib.request
-urllib.request.urlopen("http://127.0.0.1:$PORT/health", timeout=2)
+urllib.request.urlopen("http://127.0.0.1:$PORT/healthz", timeout=2)
 PY
     then
-      step "Proxy already running with PID $(cat "$pid_file")"
+      step "Runtime already running with PID $(cat "$pid_file")"
       return
     fi
-    step "Found stale proxy PID $(cat "$pid_file") without health response; restarting."
+    step "Found stale runtime PID $(cat "$pid_file") without health response; restarting."
     if [[ "$DRY_RUN" != "1" ]]; then
       kill "$(cat "$pid_file")" 2>/dev/null || true
       rm -f "$pid_file"
     fi
   fi
-  if [[ "$DRY_RUN" == "1" ]]; then step "Would start Python proxy on port $PORT"; return; fi
-  (cd "$PROJECT_ROOT" && nohup python3 .codex/deepseek_responses_shim.py --port "$PORT" --log-path .codex/deepseek-proxy.log.jsonl >.codex/deepseek-proxy.stdout.log 2>.codex/deepseek-proxy.stderr.log & echo $! > .codex/deepseek-proxy.pid)
-  step "Started proxy PID $(cat "$pid_file") on port $PORT"
+  if [[ "$DRY_RUN" == "1" ]]; then step "Would start scheduler runtime on port $PORT"; return; fi
+  (cd "$PROJECT_ROOT" && nohup python3 .codex/runtime/deepseek_scheduler.py --port "$PORT" --log-path .codex/deepseek-proxy.log.jsonl --project-root . --user-config user_config.json --task-store .codex/runtime/task_queue.json >.codex/deepseek-proxy.stdout.log 2>.codex/deepseek-proxy.stderr.log & echo $! > .codex/deepseek-proxy.pid)
+  step "Started runtime PID $(cat "$pid_file") on port $PORT"
 }
 
 stop_proxy() {
   local pid_file
   pid_file="$(project_path ".codex/deepseek-proxy.pid")"
-  [[ -f "$pid_file" ]] || { step "No proxy pid file found."; return; }
+  [[ -f "$pid_file" ]] || { step "No runtime pid file found."; return; }
   local pid
   pid="$(cat "$pid_file")"
   if kill -0 "$pid" 2>/dev/null; then
-    if [[ "$DRY_RUN" == "1" ]]; then step "Would stop proxy PID $pid"; else kill "$pid"; step "Stopped proxy PID $pid"; fi
+    if [[ "$DRY_RUN" == "1" ]]; then step "Would stop runtime PID $pid"; else kill "$pid"; step "Stopped runtime PID $pid"; fi
   fi
   [[ "$DRY_RUN" == "1" ]] || rm -f "$pid_file"
 }
@@ -640,7 +699,7 @@ export_shareable() {
   local destination="${OUT_FILE:-$PROJECT_ROOT/codex-deepseek-subagents.zip}"
   if [[ "$DRY_RUN" == "1" ]]; then step "Would export shareable skill zip to $destination"; return; fi
   rm -f "$destination"
-  (cd "$SKILL_ROOT" && zip -qr "$destination" SKILL.md agents scripts templates -x '*.local.env.sh' '*.local.env.ps1' '*/deepseek-proxy.log.jsonl' '*/backups/*')
+  (cd "$SKILL_ROOT" && zip -qr "$destination" SKILL.md agents scripts templates scheduler -x '*.local.env.sh' '*.local.env.ps1' '*/deepseek-proxy.log.jsonl' '*/backups/*')
   step "Exported shareable skill zip: $destination"
 }
 
@@ -652,7 +711,9 @@ case "$COMMAND" in
   desktop-doctor) doctor ;;
   delegate) delegate ;;
   start-proxy) start_proxy ;;
+  start-runtime) start_proxy ;;
   stop-proxy) stop_proxy ;;
+  stop-runtime) stop_proxy ;;
   test-proxy) test_proxy ;;
   usage) show_usage ;;
   redact) redact_check ;;

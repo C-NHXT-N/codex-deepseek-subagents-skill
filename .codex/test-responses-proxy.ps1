@@ -1,3 +1,4 @@
+﻿# Managed by codex-deepseek-subagents
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\deepseek.local.env.ps1"
 
@@ -29,3 +30,5 @@ $response = Invoke-RestMethod -Method Post -Uri "$env:DEEPSEEK_PROXY_BASE_URL/re
     reasoning_tokens = $response.usage.reasoning_tokens
     total_tokens = $response.usage.total_tokens
 } | ConvertTo-Json -Compress
+
+

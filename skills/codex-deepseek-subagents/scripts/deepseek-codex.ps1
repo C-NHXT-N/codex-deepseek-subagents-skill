@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("install", "update", "uninstall", "doctor", "desktop-doctor", "delegate", "start-proxy", "stop-proxy", "test-proxy", "usage", "redact", "export-shareable")]
+    [ValidateSet("install", "update", "uninstall", "doctor", "desktop-doctor", "delegate", "start-proxy", "stop-proxy", "test-proxy", "start-runtime", "stop-runtime", "usage", "redact", "export-shareable")]
     [string]$Command = "doctor",
 
     [string]$ProjectRoot = (Get-Location).Path,
@@ -31,6 +31,7 @@ $PortExplicit = $PSBoundParameters.ContainsKey("Port")
 $ManagedMarker = "# Managed by codex-deepseek-subagents"
 $SkillRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $TemplateRoot = Join-Path $SkillRoot "templates"
+$SchedulerRoot = Join-Path $SkillRoot "scheduler"
 
 function Resolve-FullPath {
     param([string]$Path)
@@ -75,9 +76,8 @@ function Escape-ShString {
     return $Value.Replace("'", "'\''")
 }
 
-function Expand-Template {
-    param([string]$TemplateName)
-    $content = Get-Content -Raw (Join-Path $TemplateRoot $TemplateName)
+function Expand-ContentTemplate {
+    param([string]$Content)
     $content = $content.Replace("__API_KEY_PS__", (Escape-TemplateValue $ApiKey))
     $content = $content.Replace("__BASE_URL_PS__", (Escape-TemplateValue $BaseUrl))
     $content = $content.Replace("__ANTHROPIC_BASE_URL_PS__", (Escape-TemplateValue $AnthropicBaseUrl))
@@ -93,6 +93,16 @@ function Expand-Template {
     $content = $content.Replace("__THINKING_DEFAULT_SH__", (Escape-ShString $ThinkingDefault))
     $content = $content.Replace("__PORT__", [string]$Port)
     return $content
+}
+
+function Expand-Template {
+    param([string]$TemplateName)
+    return Expand-ContentTemplate -Content (Get-Content -Raw (Join-Path $TemplateRoot $TemplateName))
+}
+
+function Expand-SchedulerSource {
+    param([string]$RelativePath)
+    return Expand-ContentTemplate -Content (Get-Content -Raw (Join-Path $SchedulerRoot $RelativePath))
 }
 
 function Test-ManagedFile {
@@ -162,6 +172,7 @@ function Add-GitIgnoreRules {
         ".codex/deepseek-proxy.pid",
         ".codex/deepseek-proxy.stdout.log",
         ".codex/deepseek-proxy.stderr.log",
+        ".codex/runtime/task_queue.json",
         ".codex/backups/"
     )
     $existing = if (Test-Path -LiteralPath $gitignore) { Get-Content -LiteralPath $gitignore } else { @() }
@@ -198,17 +209,29 @@ function Install-OrUpdate {
 
     Write-ManagedFile (Get-ProjectPath ".codex/config.toml") (Expand-Template "config.toml.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/agents/deepseek-worker.toml") (Expand-Template "deepseek-worker.toml.tpl")
+    Write-ManagedFile (Get-ProjectPath "user_config.json") (Expand-Template "user_config.json.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/deepseek.local.env.ps1") (Expand-Template "deepseek.local.env.ps1.tpl") -Secret
     Write-ManagedFile (Get-ProjectPath ".codex/deepseek.local.env.sh") (Expand-Template "deepseek.local.env.sh.tpl") -Secret
     Write-ManagedFile (Get-ProjectPath ".codex/deepseek-responses-shim.ps1") (Expand-Template "deepseek-responses-shim.ps1.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/deepseek_responses_shim.py") (Expand-Template "deepseek_responses_shim.py.tpl")
+    Write-ManagedFile (Get-ProjectPath ".codex/runtime/deepseek_scheduler.py") (Expand-SchedulerSource "deepseek_scheduler.py")
     Write-ManagedFile (Get-ProjectPath ".codex/test-deepseek-direct.ps1") (Expand-Template "test-deepseek-direct.ps1.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/test-deepseek-direct.sh") (Expand-Template "test-deepseek-direct.sh.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/test-responses-proxy.ps1") (Expand-Template "test-responses-proxy.ps1.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/test-responses-proxy.sh") (Expand-Template "test-responses-proxy.sh.tpl")
+    $taskStorePath = Get-ProjectPath ".codex/runtime/task_queue.json"
+    if ((-not (Test-Path -LiteralPath $taskStorePath)) -or $Force) {
+        Ensure-Directory (Split-Path -Parent $taskStorePath)
+        if ($DryRun) {
+            Write-Step "Would initialize runtime task store: $taskStorePath"
+        }
+        else {
+            Set-Content -LiteralPath $taskStorePath -Value (@{ tasks = @() } | ConvertTo-Json -Depth 4) -Encoding UTF8
+        }
+    }
     Add-GitIgnoreRules
     Write-Step "$(if ($IsUpdate) { 'Update' } else { 'Install' }) complete."
-    Write-Step "Post-install check: keep only one codex-deepseek-subagents skill under CODEX_HOME/skills, then run doctor, start-proxy, and test-proxy."
+    Write-Step "Post-install check: keep only one codex-deepseek-subagents skill under CODEX_HOME/skills, then run doctor, start-runtime, and test-proxy."
 }
 
 function Remove-ManagedPath {
@@ -260,12 +283,14 @@ function Remove-RuntimePath {
 
 function Uninstall-Project {
     $paths = @(
+        "user_config.json",
         ".codex/config.toml",
         ".codex/agents/deepseek-worker.toml",
         ".codex/deepseek.local.env.ps1",
         ".codex/deepseek.local.env.sh",
         ".codex/deepseek-responses-shim.ps1",
         ".codex/deepseek_responses_shim.py",
+        ".codex/runtime/deepseek_scheduler.py",
         ".codex/test-deepseek-direct.ps1",
         ".codex/test-deepseek-direct.sh",
         ".codex/test-responses-proxy.ps1",
@@ -279,7 +304,8 @@ function Uninstall-Project {
         ".codex/deepseek-proxy.log.jsonl",
         ".codex/deepseek-proxy.pid",
         ".codex/deepseek-proxy.stdout.log",
-        ".codex/deepseek-proxy.stderr.log"
+        ".codex/deepseek-proxy.stderr.log",
+        ".codex/runtime/task_queue.json"
     )
     foreach ($relative in $runtimePaths) {
         Remove-RuntimePath (Get-ProjectPath $relative)
@@ -341,10 +367,13 @@ function Get-InstallState {
     $configExists = Test-Path -LiteralPath (Get-ProjectPath ".codex/config.toml")
     $workerExists = Test-Path -LiteralPath (Get-ProjectPath ".codex/agents/deepseek-worker.toml")
     $envExists = Test-Path -LiteralPath (Get-ProjectPath ".codex/deepseek.local.env.ps1")
-    $pythonShimExists = Test-Path -LiteralPath (Get-ProjectPath ".codex/deepseek_responses_shim.py")
-    if (-not ($configExists -or $workerExists -or $envExists -or $pythonShimExists)) { return "not_installed" }
-    if ($configExists -and $workerExists -and $envExists -and $pythonShimExists) { return "ok" }
-    if (-not $pythonShimExists) { return "stale_missing_python_shim" }
+    $userConfigExists = Test-Path -LiteralPath (Get-ProjectPath "user_config.json")
+    $runtimeEntryExists = Test-Path -LiteralPath (Get-ProjectPath ".codex/runtime/deepseek_scheduler.py")
+    $legacyShimExists = Test-Path -LiteralPath (Get-ProjectPath ".codex/deepseek_responses_shim.py")
+    if (-not ($configExists -or $workerExists -or $envExists -or $userConfigExists -or $runtimeEntryExists -or $legacyShimExists)) { return "not_installed" }
+    if ($runtimeEntryExists -and $configExists -and $workerExists -and $envExists -and $userConfigExists) { return "ok" }
+    if ($legacyShimExists -and -not $runtimeEntryExists) { return "stale_legacy_runtime" }
+    if (-not $runtimeEntryExists) { return "stale_missing_runtime" }
     return "incomplete"
 }
 
@@ -526,24 +555,24 @@ function Test-DeepSeekThinking {
 function Start-Proxy {
     Import-LocalEnv
     Sync-PortFromEnv
-    $shim = ".codex/deepseek_responses_shim.py"
-    $shimPath = Get-ProjectPath $shim
-    if (-not (Test-Path -LiteralPath $shimPath)) {
-        throw "Python proxy shim is missing: $shimPath. This install is stale or incomplete; run update first."
+    $runtime = ".codex/runtime/deepseek_scheduler.py"
+    $runtimePath = Get-ProjectPath $runtime
+    if (-not (Test-Path -LiteralPath $runtimePath)) {
+        throw "Runtime entrypoint is missing: $runtimePath. This install is stale or incomplete; run update first."
     }
     $pidFile = Get-ProjectPath ".codex/deepseek-proxy.pid"
     if (Test-Path -LiteralPath $pidFile) {
         $oldPid = (Get-Content -Raw -LiteralPath $pidFile).Trim()
         if ($oldPid -and (Get-Process -Id ([int]$oldPid) -ErrorAction SilentlyContinue)) {
             try {
-                $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/healthz" -TimeoutSec 2
                 if ($health.ok) {
-                    Write-Step "Proxy already running with PID $oldPid"
+                    Write-Step "Runtime already running with PID $oldPid"
                     return
                 }
             }
             catch {
-                Write-Step "Found stale proxy PID $oldPid without health response; restarting."
+                Write-Step "Found stale runtime PID $oldPid without health response; restarting."
                 if (-not $DryRun) {
                     Stop-Process -Id ([int]$oldPid) -Force -ErrorAction SilentlyContinue
                     Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
@@ -552,7 +581,7 @@ function Start-Proxy {
         }
     }
     if ($DryRun) {
-        Write-Step "Would start proxy: $shim on port $Port"
+        Write-Step "Would start runtime: $runtime on port $Port"
         return
     }
     $python = Get-Command python -ErrorAction SilentlyContinue
@@ -560,25 +589,25 @@ function Start-Proxy {
     if (-not $python) { throw "Neither python nor python3 was found." }
     $stdout = Get-ProjectPath ".codex/deepseek-proxy.stdout.log"
     $stderr = Get-ProjectPath ".codex/deepseek-proxy.stderr.log"
-    $process = Start-ProcessCleanEnvironment -FilePath $python.Source -ArgumentList @($shim, "--port", [string]$Port, "--log-path", ".codex/deepseek-proxy.log.jsonl") -WorkingDirectory (Resolve-FullPath $ProjectRoot) -StandardOutputPath $stdout -StandardErrorPath $stderr
+    $process = Start-ProcessCleanEnvironment -FilePath $python.Source -ArgumentList @($runtime, "--port", [string]$Port, "--log-path", ".codex/deepseek-proxy.log.jsonl", "--project-root", ".", "--user-config", "user_config.json", "--task-store", ".codex/runtime/task_queue.json") -WorkingDirectory (Resolve-FullPath $ProjectRoot) -StandardOutputPath $stdout -StandardErrorPath $stderr
     Set-Content -LiteralPath $pidFile -Value $process.Id -Encoding ASCII
-    Write-Step "Started proxy PID $($process.Id) on port $Port"
+    Write-Step "Started runtime PID $($process.Id) on port $Port"
 }
 
 function Stop-Proxy {
     $pidFile = Get-ProjectPath ".codex/deepseek-proxy.pid"
     if (-not (Test-Path -LiteralPath $pidFile)) {
-        Write-Step "No proxy pid file found."
+        Write-Step "No runtime pid file found."
         return
     }
     $pidText = Get-Content -Raw -LiteralPath $pidFile
     if ($pidText -and (Get-Process -Id ([int]$pidText) -ErrorAction SilentlyContinue)) {
         if ($DryRun) {
-            Write-Step "Would stop proxy PID $pidText"
+            Write-Step "Would stop runtime PID $pidText"
         }
         else {
             Stop-Process -Id ([int]$pidText) -Force
-            Write-Step "Stopped proxy PID $pidText"
+            Write-Step "Stopped runtime PID $pidText"
         }
     }
     if (-not $DryRun) { Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue }
@@ -594,10 +623,13 @@ function Test-Proxy {
 function Invoke-Doctor {
     $checks = [ordered]@{}
     $checks.project_root = Resolve-FullPath $ProjectRoot
+    $checks.user_config_exists = Test-Path -LiteralPath (Get-ProjectPath "user_config.json")
     $checks.config_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/config.toml")
     $checks.worker_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/agents/deepseek-worker.toml")
     $checks.env_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/deepseek.local.env.ps1")
-    $checks.python_shim_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/deepseek_responses_shim.py")
+    $checks.legacy_shim_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/deepseek_responses_shim.py")
+    $checks.runtime_entry_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/runtime/deepseek_scheduler.py")
+    $checks.runtime_task_store_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/runtime/task_queue.json")
     $checks.install_state = Get-InstallState
     $proxyStatus = Get-ProxyStatus
     foreach ($key in $proxyStatus.Keys) {
@@ -618,6 +650,27 @@ function Invoke-Doctor {
             $checks.env_load_error = $_.Exception.Message
         }
     }
+    if ($checks.user_config_exists) {
+        try {
+            $userConfig = Get-Content -Raw -LiteralPath (Get-ProjectPath "user_config.json") | ConvertFrom-Json
+            $userConfigPropertyNames = @($userConfig.PSObject.Properties.Name)
+            $checks.user_config_valid = (-not ($userConfigPropertyNames -contains "deepseek_api_key")) -and
+                ($userConfigPropertyNames -contains "runtime") -and
+                ($userConfigPropertyNames -contains "connected_agents") -and
+                ($userConfigPropertyNames -contains "defaults")
+            $checks.agent_registry_summary = @($userConfig.connected_agents | Where-Object { $_.enabled -ne $false } | ForEach-Object {
+                [ordered]@{
+                    name = $_.name
+                    kind = $_.kind
+                    endpoint = $_.endpoint
+                }
+            })
+        }
+        catch {
+            $checks.user_config_valid = $false
+            $checks.user_config_error = $_.Exception.Message
+        }
+    }
     try {
         $checks.direct_api = Test-DeepSeekDirect
     }
@@ -633,21 +686,21 @@ function Invoke-Doctor {
         $checks.thinking_error_category = Convert-ErrorCategory $_.Exception.Message
     }
     try {
-        $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2
-        $checks.proxy_health = $health
+        $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/healthz" -TimeoutSec 2
+        $checks.runtime_health = $health
     }
     catch {
-        if (-not $checks.python_shim_exists) {
-            $checks.proxy_health_error = "Python proxy shim is missing. This install is stale or incomplete; run update first."
-            $checks.proxy_health_error_category = "stale_install"
+        if (-not $checks.runtime_entry_exists) {
+            $checks.runtime_health_error = "Runtime entrypoint is missing. This install is stale or incomplete; run update first."
+            $checks.runtime_health_error_category = "stale_install"
         }
         elseif ($checks.proxy_pid_exists -and $checks.proxy_process_alive) {
-            $checks.proxy_health_error = "Proxy process exists but did not answer /health on port $Port."
-            $checks.proxy_health_error_category = "proxy_unhealthy"
+            $checks.runtime_health_error = "Runtime process exists but did not answer /healthz on port $Port."
+            $checks.runtime_health_error_category = "proxy_unhealthy"
         }
         else {
-            $checks.proxy_health_error = "Proxy is not running on port $Port. Run start-proxy."
-            $checks.proxy_health_error_category = "proxy_not_running"
+            $checks.runtime_health_error = "Runtime is not running on port $Port. Run start-runtime."
+            $checks.runtime_health_error_category = "proxy_not_running"
         }
     }
     $checks.desktop_native_subagent = [ordered]@{
@@ -762,7 +815,7 @@ function Export-Shareable {
         return
     }
     if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination -Force }
-    $allowedRoots = @("SKILL.md", "agents", "scripts", "templates")
+    $allowedRoots = @("SKILL.md", "agents", "scripts", "templates", "scheduler")
     $stageRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-deepseek-subagents-export-" + [System.Guid]::NewGuid().ToString("N"))
     $stageSkillRoot = Join-Path $stageRoot "codex-deepseek-subagents"
     try {
@@ -804,7 +857,9 @@ if ($MyInvocation.InvocationName -ne '.') {
         "desktop-doctor" { Invoke-DesktopDoctor }
         "delegate" { Invoke-Delegate }
         "start-proxy" { Start-Proxy }
+        "start-runtime" { Start-Proxy }
         "stop-proxy" { Stop-Proxy }
+        "stop-runtime" { Stop-Proxy }
         "test-proxy" { Test-Proxy }
         "usage" { Show-Usage }
         "redact" { Invoke-RedactCheck }

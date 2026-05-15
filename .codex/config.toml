@@ -1,6 +1,7 @@
-# Project-level Codex config for testing GPT main agent + DeepSeek worker.
-# Keep the main/default provider in the user config; this project file only adds
-# the DeepSeek worker provider behind a local Responses-compatible proxy.
+﻿# Managed by codex-deepseek-subagents
+# Project-level Codex config for GPT main agent + DeepSeek worker.
+# Keep the main/default provider in user config; this file only adds the
+# DeepSeek worker provider behind a local Responses-compatible proxy.
 
 [agents]
 max_threads = 6
@@ -11,4 +12,5 @@ name = "DeepSeek via Local Responses Proxy"
 base_url = "http://127.0.0.1:4000/v1"
 wire_api = "responses"
 env_key = "DEEPSEEK_PROXY_API_KEY"
+
 

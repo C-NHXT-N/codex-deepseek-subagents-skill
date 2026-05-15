@@ -1,5 +1,13 @@
 # Local secret/test configs
 .codex/*.local.*
+.codex/config.toml
+.codex/agents/deepseek-worker.toml
+.codex/deepseek-responses-shim.ps1
+.codex/deepseek_responses_shim.py
+.codex/test-deepseek-direct.ps1
+.codex/test-deepseek-direct.sh
+.codex/test-responses-proxy.ps1
+.codex/test-responses-proxy.sh
 .codex/deepseek-proxy.log.jsonl
 .codex/deepseek-proxy.pid
 .codex/deepseek-proxy.stdout.log
