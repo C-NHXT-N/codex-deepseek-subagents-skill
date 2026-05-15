@@ -7,12 +7,14 @@ description: Install, update, test, or remove a cost-optimized Codex multi-agent
 
 ## Quick Start
 
-Use the bundled script instead of hand-writing project config. The scripts install only into the target project `.codex/` folder and write API keys only to `.codex/deepseek.local.env.ps1` or `.codex/deepseek.local.env.sh`, which they add to `.gitignore`.
+Use the bundled scripts instead of hand-writing project config. Both the Bash and PowerShell installers generate the same managed cross-platform file set under `.codex/`, and API keys are written only to `.codex/*.local.*`.
 
 Windows PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 install -ApiKey <deepseek-key>
+powershell -ExecutionPolicy Bypass -File skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 start-proxy
+powershell -ExecutionPolicy Bypass -File skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 test-proxy
 powershell -ExecutionPolicy Bypass -File skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 doctor
 ```
 
@@ -20,21 +22,35 @@ PowerShell Core on any platform:
 
 ```powershell
 pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 install -ApiKey <deepseek-key>
-pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 doctor
-pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 delegate -Mode pro-thinking -ThinkingView hidden -Prompt "Summarize the files I explicitly provide."
 pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 start-proxy
 pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 test-proxy
+pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 doctor
+pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 delegate -Mode pro-thinking -ThinkingView hidden -Prompt "Summarize the files I explicitly provide."
 ```
 
 Linux/macOS shell:
 
 ```bash
 bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh install --api-key <deepseek-key>
-bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh doctor
-bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh delegate --mode pro-thinking --thinking-view hidden --prompt "Summarize the files I explicitly provide."
 bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh start-proxy
 bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh test-proxy
+bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh doctor
+bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh delegate --mode pro-thinking --thinking-view hidden --prompt "Summarize the files I explicitly provide."
 ```
+
+Custom port example:
+
+```bash
+bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh install \
+  --api-key <deepseek-key> \
+  --port 5001
+
+bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh start-proxy
+bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh test-proxy
+bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh doctor
+```
+
+Later `start-proxy`, `test-proxy`, and `doctor` reuse the installed `DEEPSEEK_PROXY_BASE_URL` port unless you explicitly pass `--port` or `-Port`.
 
 Run destructive or broad actions with `-DryRun` first:
 
@@ -42,16 +58,18 @@ Run destructive or broad actions with `-DryRun` first:
 pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 uninstall -DryRun
 ```
 
+After installing or copying this skill into Codex, verify that only one active copy exists under `CODEX_HOME/skills`. Do not keep backups under `CODEX_HOME/skills/backups`, because Codex scans nested `SKILL.md` files there as active skills. Move backups outside the skills tree, such as `CODEX_HOME/skill-backups`.
+
 ## Commands
 
-- `install`: create managed Codex provider, DeepSeek worker, local env, proxy shim, tests, and `.gitignore` rules.
-- `update`: refresh key/model/base URL/port/thinking defaults while preserving non-managed user files.
-- `uninstall`: remove only files marked `# Managed by codex-deepseek-subagents`; use `-RemoveSkill` to delete the skill folder too.
+- `install`: create managed Codex provider, DeepSeek worker, local env files, proxy shims, tests, and `.gitignore` rules.
+- `update`: refresh key, model, base URL, port, and thinking defaults while preserving non-managed user files.
+- `uninstall`: remove only files marked `# Managed by codex-deepseek-subagents`, stop the local proxy when needed, and remove proxy runtime files.
 - `doctor`: check local files, gitignore, direct DeepSeek API, thinking mode, and proxy health.
 - `desktop-doctor`: same checks as `doctor`, with a note about Codex Desktop native subagent availability.
 - `delegate`: direct fallback call to DeepSeek when Codex Desktop has not registered `deepseek_worker`.
 - `start-proxy`, `stop-proxy`, `test-proxy`: manage the local `/v1/responses` shim.
-- `usage`: summarize prompt/completion/reasoning tokens from proxy logs, grouped by visible model label when available.
+- `usage`: summarize prompt, completion, and reasoning tokens from proxy logs, grouped by visible model label when available.
 - `redact`: scan for leaked `sk-...` keys outside `.local` files, logs, backups, and `.git`.
 - `export-shareable`: create a zip of the skill folder without project `.codex` secrets.
 
@@ -59,16 +77,38 @@ Useful options:
 
 - `-ProjectRoot <path>`: install into another project.
 - `-ApiKey <key>`: set or update the DeepSeek key.
-- `-Model deepseek-v4-pro`, `-FastModel deepseek-v4-flash`: choose worker and fallback models.
-- `-Port 4000`: choose the local proxy port.
-- `-ThinkingDefault disabled|high|max`: set proxy default thinking behavior.
-- `-Mode pro-thinking|flash-thinking|pro|flash`: select the DeepSeek delegate model and thinking mode.
-- `-ThinkingView hidden|summary|raw`: choose how `delegate` handles DeepSeek reasoning content.
+- `-Port 4000`: choose the local proxy port. Explicit command-line port values override the installed env port.
 - `-Prompt <text>` or `-PromptFile <path>`: explicit content to send with `delegate`; no files are read automatically.
-- `-MaxTokens <n>`: output token cap for `delegate`.
 - `-DryRun`: print intended changes without writing.
 - `-Force`: allow overwriting non-managed target files after review.
-- `-NoBackup`: skip backups; default behavior backs up changed files to `.codex/backups/`.
+
+## Managed Files
+
+Both installers generate the same helper set:
+
+```text
+.codex/config.toml
+.codex/agents/deepseek-worker.toml
+.codex/deepseek.local.env.sh
+.codex/deepseek.local.env.ps1
+.codex/deepseek_responses_shim.py
+.codex/deepseek-responses-shim.ps1
+.codex/test-deepseek-direct.sh
+.codex/test-deepseek-direct.ps1
+.codex/test-responses-proxy.sh
+.codex/test-responses-proxy.ps1
+```
+
+The installer appends these gitignore rules when missing:
+
+```text
+.codex/*.local.*
+.codex/deepseek-proxy.log.jsonl
+.codex/deepseek-proxy.pid
+.codex/deepseek-proxy.stdout.log
+.codex/deepseek-proxy.stderr.log
+.codex/backups/
+```
 
 ## Delegation Rules
 
@@ -82,46 +122,27 @@ This may send repository content to DeepSeek or the configured proxy. Confirm be
 
 Default to `listed paths only`. If the task can be done from a summary, send the summary and paths rather than full file contents. There should be no DeepSeek proxy log entry before the user confirms delegation.
 
-If Codex Desktop reports `agent type is currently not available` for `deepseek_worker`, use the `delegate` fallback after the same confirmation. It sends only `-Prompt` or `-PromptFile` content and prints the visible model label and token accounting:
-
-```powershell
-pwsh skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 delegate -Mode pro-thinking -Prompt "<confirmed task>"
-```
-
-```bash
-bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh delegate --mode pro-thinking --prompt "<confirmed task>"
-```
+If Codex Desktop reports `agent type is currently not available` for `deepseek_worker`, use the `delegate` fallback after the same confirmation. It sends only `-Prompt` or `-PromptFile` content and never reads repository files automatically.
 
 ## Thinking Mode
 
 Use DeepSeek thinking mode only when it is worth the token cost:
 
-- Simple edits, formatting, and mechanical tasks: use `pro` or `flash` (`thinking.type = "disabled"`).
-- Complex implementation or debugging: use `pro-thinking` or `flash-thinking` (`thinking.type = "enabled"`, `reasoning_effort = "high"`).
-- Ambiguous architecture or hard agentic work: use `reasoning_effort = "max"` only after warning about extra cost.
+- Simple edits, formatting, and mechanical tasks: use `pro` or `flash`.
+- Complex implementation or debugging: use `pro-thinking` or `flash-thinking`.
+- Ambiguous architecture or hard agentic work: use max reasoning effort only after warning about extra cost.
 
 Never persist or feed `reasoning_content` back into prompts. Keep only coarse metadata such as reasoning token counts and whether reasoning was present.
 
-`delegate` has three user-facing reasoning display modes:
-
-- `hidden` (default): do not print raw `reasoning_content`; show model label and token counts only.
-- `summary`: ask DeepSeek to add a short reasoning summary to the final answer while still hiding raw `reasoning_content`.
-- `raw`: print raw `reasoning_content` in this command's JSON output only. Do not store it in logs, do not copy it into follow-up prompts, and warn the user before using it because it may increase exposure of sensitive task context.
-
-Visible labels used by fallback and proxy logs:
-
-- `pro-thinking`: `deepseek-v4-pro(thinking)`
-- `flash-thinking`: `deepseek-v4-flash(thinking)`
-- `pro`: `deepseek-v4-pro`
-- `flash`: `deepseek-v4-flash`
-
 ## Architecture Notes
 
-Codex custom providers require a Responses-compatible endpoint. DeepSeek's public API is OpenAI/Anthropic-compatible, so this skill installs a local smoke-test shim that exposes `/v1/responses` and forwards to DeepSeek Chat Completions. Prefer a mature open-source proxy such as LiteLLM or Julep Open Responses for production use if it passes Codex tool-call and streaming tests.
+Codex custom providers require a Responses-compatible endpoint. DeepSeek's public API is OpenAI/Anthropic-compatible, so this skill installs a local smoke-test shim that exposes `/v1/responses` and forwards to DeepSeek Chat Completions.
 
-Use DeepSeek OpenCode/Claude Code integration docs as provider/model references, not as proof that Codex can directly use those endpoints. Codex still needs its configured provider to satisfy the current Codex `wire_api = "responses"` behavior.
+The local shim is a smoke-test/basic-experiment proxy, not a production-complete Responses implementation. Unsupported features such as `stream=true`, `tools`, and `tool_choice` fail with a clear `400` error instead of being silently ignored.
 
-Codex Desktop native subagent cards are controlled by the Desktop runtime. A skill can install `.codex/agents/deepseek-worker.toml`, but it cannot force the app to register or visually render that agent type. When native registration is unavailable, `delegate` is the supported fallback and provides visible model/thinking labels in command output and logs.
+If you need full Codex tool-call or streaming support, replace the shim with a mature Responses-compatible proxy and validate those behaviors yourself.
+
+The default local proxy is the Python shim at `.codex/deepseek_responses_shim.py`. The PowerShell shim is installed only as a compatibility/reference file because `System.Net.HttpListener` is not reliable in every Windows host environment.
 
 ## Safety Checks
 

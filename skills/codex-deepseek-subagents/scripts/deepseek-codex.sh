@@ -12,6 +12,7 @@ FAST_MODEL="deepseek-v4-flash"
 BASE_URL="https://api.deepseek.com"
 ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
 PORT="4000"
+PORT_EXPLICIT=0
 THINKING_DEFAULT="disabled"
 DRY_RUN=0
 NO_BACKUP=0
@@ -66,7 +67,7 @@ while [[ $# -gt 0 ]]; do
     --fast-model|-FastModel) FAST_MODEL="$2"; shift 2 ;;
     --base-url|-BaseUrl) BASE_URL="$2"; shift 2 ;;
     --anthropic-base-url|-AnthropicBaseUrl) ANTHROPIC_BASE_URL="$2"; shift 2 ;;
-    --port|-Port) PORT="$2"; shift 2 ;;
+    --port|-Port) PORT="$2"; PORT_EXPLICIT=1; shift 2 ;;
     --thinking-default|-ThinkingDefault) THINKING_DEFAULT="$2"; shift 2 ;;
     --mode|-Mode) MODE="$2"; shift 2 ;;
     --thinking-view|-ThinkingView) THINKING_VIEW="$2"; shift 2 ;;
@@ -212,25 +213,32 @@ install_or_update() {
   if [[ -z "$API_KEY" && "$is_update" == "1" ]]; then
     local existing
     existing="$(project_path ".codex/deepseek.local.env.sh")"
-    if [[ -f "$existing" ]]; then
-      API_KEY="$(sed -n "s/^export DEEPSEEK_API_KEY='\(.*\)'$/\1/p" "$existing" | head -n 1)"
-    fi
-    [[ -z "$API_KEY" ]] && { echo "update requires --api-key when no existing managed key can be reused." >&2; exit 1; }
+    reuse_api_key_from_managed_env "$existing" || true
+    [[ -z "$API_KEY" ]] && { echo "update requires --api-key when no existing managed key can be reused. Pass --api-key explicitly." >&2; exit 1; }
   fi
   write_managed_file "$(project_path ".codex/config.toml")" "$(expand_template "config.toml.tpl")"
   write_managed_file "$(project_path ".codex/agents/deepseek-worker.toml")" "$(expand_template "deepseek-worker.toml.tpl")"
   write_managed_file "$(project_path ".codex/deepseek.local.env.sh")" "$(expand_template "deepseek.local.env.sh.tpl")" 1
   write_managed_file "$(project_path ".codex/deepseek.local.env.ps1")" "$(powershell_template_or_comment)" 1
+  write_managed_file "$(project_path ".codex/deepseek-responses-shim.ps1")" "$(powershell_shim_template_or_comment)"
   write_managed_file "$(project_path ".codex/deepseek_responses_shim.py")" "$(expand_template "deepseek_responses_shim.py.tpl")"
   write_managed_file "$(project_path ".codex/test-deepseek-direct.sh")" "$(expand_template "test-deepseek-direct.sh.tpl")"
   write_managed_file "$(project_path ".codex/test-responses-proxy.sh")" "$(expand_template "test-responses-proxy.sh.tpl")"
+  write_managed_file "$(project_path ".codex/test-deepseek-direct.ps1")" "$(powershell_direct_test_template_or_comment)"
+  write_managed_file "$(project_path ".codex/test-responses-proxy.ps1")" "$(powershell_proxy_test_template_or_comment)"
   add_gitignore_rules
   step "$([[ "$is_update" == "1" ]] && echo Update || echo Install) complete."
+  step "Post-install check: keep only one codex-deepseek-subagents skill under CODEX_HOME/skills, then run doctor, start-proxy, and test-proxy."
 }
 
 powershell_template_or_comment() {
   # Keep Windows files available even when installing from bash.
-  API_KEY_PS="$API_KEY" BASE_URL_PS="$BASE_URL" ANTHROPIC_BASE_URL_PS="$ANTHROPIC_BASE_URL" MODEL_PS="$MODEL" FAST_MODEL_PS="$FAST_MODEL" THINKING_DEFAULT_PS="$THINKING_DEFAULT" PORT_PS="$PORT" python3 - "$TEMPLATE_ROOT/deepseek.local.env.ps1.tpl" <<'PY'
+  powershell_expand_template "deepseek.local.env.ps1.tpl"
+}
+
+powershell_expand_template() {
+  local template="$1"
+  API_KEY_PS="$API_KEY" BASE_URL_PS="$BASE_URL" ANTHROPIC_BASE_URL_PS="$ANTHROPIC_BASE_URL" MODEL_PS="$MODEL" FAST_MODEL_PS="$FAST_MODEL" THINKING_DEFAULT_PS="$THINKING_DEFAULT" PORT_PS="$PORT" python3 - "$TEMPLATE_ROOT/$template" <<'PY'
 import os, sys
 path = sys.argv[1]
 text = open(path, encoding="utf-8").read()
@@ -247,6 +255,18 @@ for key, value in replacements.items():
     text = text.replace(key, value)
 print(text)
 PY
+}
+
+powershell_shim_template_or_comment() {
+  powershell_expand_template "deepseek-responses-shim.ps1.tpl"
+}
+
+powershell_direct_test_template_or_comment() {
+  powershell_expand_template "test-deepseek-direct.ps1.tpl"
+}
+
+powershell_proxy_test_template_or_comment() {
+  powershell_expand_template "test-responses-proxy.ps1.tpl"
 }
 
 remove_managed_path() {
@@ -271,9 +291,12 @@ uninstall_project() {
     ".codex/agents/deepseek-worker.toml"
     ".codex/deepseek.local.env.sh"
     ".codex/deepseek.local.env.ps1"
+    ".codex/deepseek-responses-shim.ps1"
     ".codex/deepseek_responses_shim.py"
     ".codex/test-deepseek-direct.sh"
     ".codex/test-responses-proxy.sh"
+    ".codex/test-deepseek-direct.ps1"
+    ".codex/test-responses-proxy.ps1"
   )
   for rel in "${paths[@]}"; do remove_managed_path "$(project_path "$rel")"; done
   for rel in ".codex/deepseek-proxy.log.jsonl" ".codex/deepseek-proxy.pid" ".codex/deepseek-proxy.stdout.log" ".codex/deepseek-proxy.stderr.log"; do
@@ -295,15 +318,105 @@ import_env() {
   source "$env_file"
 }
 
+sync_port_from_env() {
+  if [[ "$PORT_EXPLICIT" == "1" ]]; then
+    return
+  fi
+
+  if [[ -n "${DEEPSEEK_PROXY_BASE_URL:-}" ]]; then
+    local parsed
+    parsed="$(
+      DEEPSEEK_PROXY_BASE_URL="$DEEPSEEK_PROXY_BASE_URL" python3 - <<'PY'
+import os
+from urllib.parse import urlparse
+
+url = os.environ.get("DEEPSEEK_PROXY_BASE_URL", "")
+parsed = urlparse(url)
+print(parsed.port or "")
+PY
+    )"
+    if [[ -n "$parsed" ]]; then
+      PORT="$parsed"
+    fi
+  fi
+}
+
+reuse_api_key_from_managed_env() {
+  local existing="$1"
+  if [[ ! -f "$existing" ]] || ! is_managed_file "$existing"; then
+    return 1
+  fi
+
+  local reused
+  reused="$(
+    bash -c 'source "$1"; printf "%s" "${DEEPSEEK_API_KEY:-}"' _ "$existing"
+  )" || return 1
+
+  if [[ -z "$reused" ]]; then
+    return 1
+  fi
+
+  API_KEY="$reused"
+}
+
 doctor() {
   import_env
   require_command python3
-  (cd "$PROJECT_ROOT" && python3 - <<'PY'
-import json, os, urllib.request, urllib.error
+  sync_port_from_env
+  PORT_ENV="$PORT" PROJECT_ROOT_ENV="$PROJECT_ROOT" python3 - <<'PY'
+import json, os, signal, urllib.request, urllib.error
+
+root = os.environ["PROJECT_ROOT_ENV"]
+os.chdir(root)
+
+def exists(path):
+    return os.path.exists(path)
+
+def classify_error(message):
+    text = str(message)
+    if any(token in text for token in ("DEEPSEEK_API_KEY", "401", "403", "Unauthorized", "Invalid proxy authorization")):
+        return "api_key_missing_or_invalid"
+    if any(token in text for token in ("Connection refused", "actively refused", "No connection could be made", "Proxy is not running")):
+        return "proxy_not_running"
+    if any(token in text for token in ("Address already in use", "Only one usage of each socket address", "port")):
+        return "port_in_use"
+    if any(token in text for token in ("timed out", "Temporary failure", "Name or service not known", "SSL", "TLS", "urlopen error")):
+        return "network_or_api_error"
+    return "unknown_error"
+
+config_exists = exists(".codex/config.toml")
+worker_exists = exists(".codex/agents/deepseek-worker.toml")
+env_exists = exists(".codex/deepseek.local.env.sh")
+python_shim_exists = exists(".codex/deepseek_responses_shim.py")
+if not any((config_exists, worker_exists, env_exists, python_shim_exists)):
+    install_state = "not_installed"
+elif all((config_exists, worker_exists, env_exists, python_shim_exists)):
+    install_state = "ok"
+elif not python_shim_exists:
+    install_state = "stale_missing_python_shim"
+else:
+    install_state = "incomplete"
+
+pid_exists = exists(".codex/deepseek-proxy.pid")
+process_alive = False
+if pid_exists:
+    try:
+        with open(".codex/deepseek-proxy.pid", encoding="utf-8") as handle:
+            pid = int(handle.read().strip())
+        os.kill(pid, 0)
+        process_alive = True
+    except Exception:
+        process_alive = False
+
 checks = {
-    "config_exists": os.path.exists(".codex/config.toml"),
-    "worker_exists": os.path.exists(".codex/agents/deepseek-worker.toml"),
-    "env_exists": os.path.exists(".codex/deepseek.local.env.sh"),
+    "project_root": root,
+    "config_exists": config_exists,
+    "worker_exists": worker_exists,
+    "env_exists": env_exists,
+    "python_shim_exists": python_shim_exists,
+    "install_state": install_state,
+    "proxy_pid_exists": pid_exists,
+    "proxy_process_alive": process_alive,
     "env_ignored": ".codex/*.local.*" in open(".gitignore", encoding="utf-8").read() if os.path.exists(".gitignore") else False,
 }
 try:
@@ -314,11 +427,38 @@ try:
     checks["direct_api"] = {"ok": "direct-ok" in str(data["choices"][0]["message"].get("content")), "total_tokens": data.get("usage", {}).get("total_tokens")}
 except Exception as exc:
     checks["direct_api_error"] = str(exc)
+    checks["direct_api_error_category"] = classify_error(exc)
 try:
-    urllib.request.urlopen("http://127.0.0.1:" + os.environ["DEEPSEEK_PROXY_BASE_URL"].split(":")[-1].split("/")[0] + "/health", timeout=2)
-    checks["proxy_health"] = {"ok": True}
-except Exception:
-    checks["proxy_health_error"] = "Proxy is not running. Run start-proxy."
+    body = {"model": os.environ["DEEPSEEK_OPENAI_MODEL"], "messages": [{"role":"user","content":"Which number is larger, 9.11 or 9.8? Reply with only the larger number."}], "thinking": {"type":"enabled", "reasoning_effort":"high"}, "max_tokens": 1024, "stream": False}
+    req = urllib.request.Request(os.environ["DEEPSEEK_OPENAI_BASE_URL"].rstrip("/") + "/chat/completions", data=json.dumps(body).encode(), headers={"Authorization":"Bearer "+os.environ["DEEPSEEK_API_KEY"],"Content-Type":"application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=120) as res:
+        data = json.loads(res.read().decode())
+    message = data["choices"][0]["message"]
+    usage = data.get("usage") or {}
+    details = usage.get("completion_tokens_details") or {}
+    checks["thinking"] = {
+        "ok": bool(message.get("reasoning_content")),
+        "content": message.get("content"),
+        "model_label": str(data.get("model")) + "(thinking)",
+        "reasoning_tokens": details.get("reasoning_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+    }
+except Exception as exc:
+    checks["thinking_error"] = str(exc)
+    checks["thinking_error_category"] = classify_error(exc)
+try:
+    with urllib.request.urlopen("http://127.0.0.1:" + os.environ["PORT_ENV"] + "/health", timeout=2) as res:
+        checks["proxy_health"] = json.loads(res.read().decode())
+except Exception as exc:
+    if not python_shim_exists:
+        checks["proxy_health_error"] = "Python proxy shim is missing. This install is stale or incomplete; run update first."
+        checks["proxy_health_error_category"] = "stale_install"
+    elif pid_exists and process_alive:
+        checks["proxy_health_error"] = "Proxy process exists but did not answer /health on port " + os.environ["PORT_ENV"] + "."
+        checks["proxy_health_error_category"] = "proxy_unhealthy"
+    else:
+        checks["proxy_health_error"] = "Proxy is not running on port " + os.environ["PORT_ENV"] + ". Run start-proxy."
+        checks["proxy_health_error_category"] = "proxy_not_running"
 checks["desktop_native_subagent"] = {
     "configured_agent": "deepseek_worker",
     "worker_config_exists": checks["worker_exists"],
@@ -328,7 +468,6 @@ checks["desktop_native_subagent"] = {
 }
 print(json.dumps(checks, ensure_ascii=False, indent=2))
 PY
-)
 }
 
 delegate() {
@@ -410,6 +549,10 @@ PY
 start_proxy() {
   import_env
   require_command python3
+  sync_port_from_env
+  local shim
+  shim="$(project_path ".codex/deepseek_responses_shim.py")"
+  [[ -f "$shim" ]] || { echo "Python proxy shim is missing: $shim. This install is stale or incomplete; run update first." >&2; exit 1; }
   local pid_file
   pid_file="$(project_path ".codex/deepseek-proxy.pid")"
   if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
@@ -447,6 +590,7 @@ stop_proxy() {
 test_proxy() {
   import_env
   require_command python3
+  sync_port_from_env
   (cd "$PROJECT_ROOT" && ./.codex/test-responses-proxy.sh)
 }
 

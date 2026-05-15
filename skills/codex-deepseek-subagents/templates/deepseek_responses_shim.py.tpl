@@ -89,6 +89,24 @@ def build_handler(log_path):
 
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            unsupported = []
+            if payload.get("stream"):
+                unsupported.append("stream=true")
+            if payload.get("tools"):
+                unsupported.append("tools")
+            if payload.get("tool_choice"):
+                unsupported.append("tool_choice")
+            if unsupported:
+                write_json(self, 400, {
+                    "error": {
+                        "message": (
+                            "This smoke-test shim does not implement: "
+                            + ", ".join(unsupported)
+                            + ". Use stream=false, no tools, or replace it with a production Responses-compatible proxy."
+                        )
+                    }
+                })
+                return
             model = str(payload.get("model") or os.environ.get("DEEPSEEK_OPENAI_MODEL") or "__MODEL_SH__")
             messages = response_input_to_messages(payload.get("input"))
             if not messages:

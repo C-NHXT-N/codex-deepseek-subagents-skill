@@ -27,6 +27,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$PortExplicit = $PSBoundParameters.ContainsKey("Port")
 $ManagedMarker = "# Managed by codex-deepseek-subagents"
 $SkillRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $TemplateRoot = Join-Path $SkillRoot "templates"
@@ -44,6 +45,16 @@ function Get-ProjectPath {
 function Write-Step {
     param([string]$Message)
     Write-Host "[codex-deepseek-subagents] $Message"
+}
+
+function Convert-ErrorCategory {
+    param([string]$Message)
+    if ($Message -match 'DEEPSEEK_API_KEY|401|403|Unauthorized|Invalid proxy authorization') { return "api_key_missing_or_invalid" }
+    if ($Message -match 'Proxy is not running|No connection could be made|actively refused|connection refused') { return "proxy_not_running" }
+    if ($Message -match 'Only one usage of each socket address|address already in use|port') { return "port_in_use" }
+    if ($Message -match 'timed out|GetResult|NameResolutionFailure|network|SSL|TLS') { return "network_or_api_error" }
+    if ($Message -like "*发送请求*") { return "network_or_api_error" }
+    return "unknown_error"
 }
 
 function Escape-TemplateValue {
@@ -175,7 +186,7 @@ function Install-OrUpdate {
     }
     if (-not $ApiKey -and $IsUpdate) {
         $existingEnv = Get-ProjectPath ".codex/deepseek.local.env.ps1"
-        if (Test-Path -LiteralPath $existingEnv) {
+        if (Test-ManagedFile $existingEnv) {
             $existing = Get-Content -Raw -LiteralPath $existingEnv
             $match = [regex]::Match($existing, '\$env:DEEPSEEK_API_KEY\s*=\s*''([^'']*)''')
             if ($match.Success) { $script:ApiKey = $match.Groups[1].Value }
@@ -197,6 +208,7 @@ function Install-OrUpdate {
     Write-ManagedFile (Get-ProjectPath ".codex/test-responses-proxy.sh") (Expand-Template "test-responses-proxy.sh.tpl")
     Add-GitIgnoreRules
     Write-Step "$(if ($IsUpdate) { 'Update' } else { 'Install' }) complete."
+    Write-Step "Post-install check: keep only one codex-deepseek-subagents skill under CODEX_HOME/skills, then run doctor, start-proxy, and test-proxy."
 }
 
 function Remove-ManagedPath {
@@ -215,6 +227,37 @@ function Remove-ManagedPath {
     Write-Step "Removed: $Path"
 }
 
+function Stop-ProxyForUninstall {
+    $pidFile = Get-ProjectPath ".codex/deepseek-proxy.pid"
+    if (-not (Test-Path -LiteralPath $pidFile)) { return }
+    try {
+        $pidText = (Get-Content -Raw -LiteralPath $pidFile).Trim()
+        if ($pidText -and (Get-Process -Id ([int]$pidText) -ErrorAction SilentlyContinue)) {
+            if ($DryRun) {
+                Write-Step "Would stop proxy PID $pidText before uninstall."
+            }
+            else {
+                Stop-Process -Id ([int]$pidText) -Force
+                Write-Step "Stopped proxy PID $pidText before uninstall."
+            }
+        }
+    }
+    catch {
+        Write-Step "Could not inspect proxy PID during uninstall: $($_.Exception.Message)"
+    }
+}
+
+function Remove-RuntimePath {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if ($DryRun) {
+        Write-Step "Would remove runtime file: $Path"
+        return
+    }
+    Remove-Item -LiteralPath $Path -Force
+    Write-Step "Removed runtime file: $Path"
+}
+
 function Uninstall-Project {
     $paths = @(
         ".codex/config.toml",
@@ -231,15 +274,15 @@ function Uninstall-Project {
     foreach ($relative in $paths) {
         Remove-ManagedPath (Get-ProjectPath $relative)
     }
-    $logPath = Get-ProjectPath ".codex/deepseek-proxy.log.jsonl"
-    if (Test-Path -LiteralPath $logPath) {
-        if ($DryRun) {
-            Write-Step "Would remove proxy log: $logPath"
-        }
-        else {
-            Remove-Item -LiteralPath $logPath -Force
-            Write-Step "Removed proxy log: $logPath"
-        }
+    Stop-ProxyForUninstall
+    $runtimePaths = @(
+        ".codex/deepseek-proxy.log.jsonl",
+        ".codex/deepseek-proxy.pid",
+        ".codex/deepseek-proxy.stdout.log",
+        ".codex/deepseek-proxy.stderr.log"
+    )
+    foreach ($relative in $runtimePaths) {
+        Remove-RuntimePath (Get-ProjectPath $relative)
     }
     if ($RemoveSkill) {
         if ($DryRun) {
@@ -258,6 +301,111 @@ function Import-LocalEnv {
         throw "Missing local env file: $envFile. Run install first."
     }
     . $envFile
+}
+
+function Sync-PortFromEnv {
+    if ($PortExplicit) { return }
+    if (-not $env:DEEPSEEK_PROXY_BASE_URL) { return }
+    try {
+        $uri = [Uri]$env:DEEPSEEK_PROXY_BASE_URL
+        if ($uri.Port -gt 0) {
+            $script:Port = $uri.Port
+        }
+    }
+    catch {}
+}
+
+function Test-ShouldScanPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$RootPath,
+        [Parameter(Mandatory = $true)][string]$FullPath,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if ($Name -like "*.local.*" -or $Name -eq "deepseek-proxy.log.jsonl") {
+        return $false
+    }
+
+    $normalizedRoot = $RootPath.TrimEnd('\', '/')
+    $relative = if ($FullPath.StartsWith($normalizedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $FullPath.Substring($normalizedRoot.Length).TrimStart('\', '/')
+    }
+    else {
+        [System.IO.Path]::GetRelativePath($RootPath, $FullPath)
+    }
+    $parts = $relative -split '[\\/]'
+    return ($parts -notcontains ".git") -and ($parts -notcontains "backups")
+}
+
+function Get-InstallState {
+    $configExists = Test-Path -LiteralPath (Get-ProjectPath ".codex/config.toml")
+    $workerExists = Test-Path -LiteralPath (Get-ProjectPath ".codex/agents/deepseek-worker.toml")
+    $envExists = Test-Path -LiteralPath (Get-ProjectPath ".codex/deepseek.local.env.ps1")
+    $pythonShimExists = Test-Path -LiteralPath (Get-ProjectPath ".codex/deepseek_responses_shim.py")
+    if (-not ($configExists -or $workerExists -or $envExists -or $pythonShimExists)) { return "not_installed" }
+    if ($configExists -and $workerExists -and $envExists -and $pythonShimExists) { return "ok" }
+    if (-not $pythonShimExists) { return "stale_missing_python_shim" }
+    return "incomplete"
+}
+
+function Get-ProxyStatus {
+    $pidFile = Get-ProjectPath ".codex/deepseek-proxy.pid"
+    $status = [ordered]@{
+        proxy_pid_exists = Test-Path -LiteralPath $pidFile
+        proxy_process_alive = $false
+    }
+    if ($status.proxy_pid_exists) {
+        try {
+            $pidText = (Get-Content -Raw -LiteralPath $pidFile).Trim()
+            if ($pidText) {
+                $process = Get-Process -Id ([int]$pidText) -ErrorAction SilentlyContinue
+                $status.proxy_process_alive = [bool]$process
+            }
+        }
+        catch {
+            $status.proxy_process_error = $_.Exception.Message
+        }
+    }
+    return $status
+}
+
+function Quote-ProcessArgument {
+    param([string]$Value)
+    if ($Value -notmatch '[\s"]') { return $Value }
+    return '"' + ($Value.Replace('\', '\\').Replace('"', '\"')) + '"'
+}
+
+function Start-ProcessCleanEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$ArgumentList,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string]$StandardOutputPath,
+        [Parameter(Mandatory = $true)][string]$StandardErrorPath
+    )
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $FilePath
+    $psi.Arguments = ($ArgumentList | ForEach-Object { Quote-ProcessArgument $_ }) -join " "
+    $psi.WorkingDirectory = $WorkingDirectory
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $psi
+    $null = $process.Start()
+    $process.BeginOutputReadLine()
+    $process.BeginErrorReadLine()
+
+    Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
+        if ($EventArgs.Data) { Add-Content -LiteralPath $Event.MessageData -Value $EventArgs.Data -Encoding UTF8 }
+    } -MessageData $StandardOutputPath | Out-Null
+    Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
+        if ($EventArgs.Data) { Add-Content -LiteralPath $Event.MessageData -Value $EventArgs.Data -Encoding UTF8 }
+    } -MessageData $StandardErrorPath | Out-Null
+
+    return $process
 }
 
 function Get-DeepSeekModeSpec {
@@ -377,10 +525,15 @@ function Test-DeepSeekThinking {
 
 function Start-Proxy {
     Import-LocalEnv
+    Sync-PortFromEnv
     $shim = ".codex/deepseek_responses_shim.py"
+    $shimPath = Get-ProjectPath $shim
+    if (-not (Test-Path -LiteralPath $shimPath)) {
+        throw "Python proxy shim is missing: $shimPath. This install is stale or incomplete; run update first."
+    }
     $pidFile = Get-ProjectPath ".codex/deepseek-proxy.pid"
     if (Test-Path -LiteralPath $pidFile) {
-        $oldPid = Get-Content -Raw -LiteralPath $pidFile
+        $oldPid = (Get-Content -Raw -LiteralPath $pidFile).Trim()
         if ($oldPid -and (Get-Process -Id ([int]$oldPid) -ErrorAction SilentlyContinue)) {
             try {
                 $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2
@@ -407,7 +560,7 @@ function Start-Proxy {
     if (-not $python) { throw "Neither python nor python3 was found." }
     $stdout = Get-ProjectPath ".codex/deepseek-proxy.stdout.log"
     $stderr = Get-ProjectPath ".codex/deepseek-proxy.stderr.log"
-    $process = Start-Process -FilePath $python.Source -ArgumentList @($shim, "--port", [string]$Port, "--log-path", ".codex/deepseek-proxy.log.jsonl") -WorkingDirectory (Resolve-FullPath $ProjectRoot) -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+    $process = Start-ProcessCleanEnvironment -FilePath $python.Source -ArgumentList @($shim, "--port", [string]$Port, "--log-path", ".codex/deepseek-proxy.log.jsonl") -WorkingDirectory (Resolve-FullPath $ProjectRoot) -StandardOutputPath $stdout -StandardErrorPath $stderr
     Set-Content -LiteralPath $pidFile -Value $process.Id -Encoding ASCII
     Write-Step "Started proxy PID $($process.Id) on port $Port"
 }
@@ -433,6 +586,7 @@ function Stop-Proxy {
 
 function Test-Proxy {
     Import-LocalEnv
+    Sync-PortFromEnv
     $script = Get-ProjectPath ".codex/test-responses-proxy.ps1"
     & $script
 }
@@ -443,20 +597,58 @@ function Invoke-Doctor {
     $checks.config_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/config.toml")
     $checks.worker_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/agents/deepseek-worker.toml")
     $checks.env_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/deepseek.local.env.ps1")
+    $checks.python_shim_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/deepseek_responses_shim.py")
+    $checks.install_state = Get-InstallState
+    $proxyStatus = Get-ProxyStatus
+    foreach ($key in $proxyStatus.Keys) {
+        $checks[$key] = $proxyStatus[$key]
+    }
     $checks.env_ignored = $false
     $gitignore = Get-ProjectPath ".gitignore"
     if (Test-Path -LiteralPath $gitignore) {
         $gitignoreText = Get-Content -Raw -LiteralPath $gitignore
         $checks.env_ignored = $gitignoreText.Contains(".codex/*.local.*")
     }
-    try { $checks.direct_api = Test-DeepSeekDirect } catch { $checks.direct_api_error = $_.Exception.Message }
-    try { $checks.thinking = Test-DeepSeekThinking } catch { $checks.thinking_error = $_.Exception.Message }
+    if ($checks.env_exists) {
+        try {
+            Import-LocalEnv
+            Sync-PortFromEnv
+        }
+        catch {
+            $checks.env_load_error = $_.Exception.Message
+        }
+    }
+    try {
+        $checks.direct_api = Test-DeepSeekDirect
+    }
+    catch {
+        $checks.direct_api_error = $_.Exception.Message
+        $checks.direct_api_error_category = Convert-ErrorCategory $_.Exception.Message
+    }
+    try {
+        $checks.thinking = Test-DeepSeekThinking
+    }
+    catch {
+        $checks.thinking_error = $_.Exception.Message
+        $checks.thinking_error_category = Convert-ErrorCategory $_.Exception.Message
+    }
     try {
         $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2
         $checks.proxy_health = $health
     }
     catch {
-        $checks.proxy_health_error = "Proxy is not running on port $Port. Run start-proxy."
+        if (-not $checks.python_shim_exists) {
+            $checks.proxy_health_error = "Python proxy shim is missing. This install is stale or incomplete; run update first."
+            $checks.proxy_health_error_category = "stale_install"
+        }
+        elseif ($checks.proxy_pid_exists -and $checks.proxy_process_alive) {
+            $checks.proxy_health_error = "Proxy process exists but did not answer /health on port $Port."
+            $checks.proxy_health_error_category = "proxy_unhealthy"
+        }
+        else {
+            $checks.proxy_health_error = "Proxy is not running on port $Port. Run start-proxy."
+            $checks.proxy_health_error_category = "proxy_not_running"
+        }
     }
     $checks.desktop_native_subagent = [ordered]@{
         configured_agent = "deepseek_worker"
@@ -544,10 +736,7 @@ function Invoke-RedactCheck {
     $findings = @()
     Get-ChildItem -LiteralPath $root -Recurse -File -Force |
         Where-Object {
-            $_.FullName -notmatch '\\.git\\' -and
-            $_.Name -notlike "*.local.*" -and
-            $_.FullName -notmatch '\\backups\\' -and
-            $_.Name -ne "deepseek-proxy.log.jsonl"
+            Test-ShouldScanPath -RootPath $root -FullPath $_.FullName -Name $_.Name
         } |
         ForEach-Object {
             try {
@@ -574,34 +763,51 @@ function Export-Shareable {
     }
     if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination -Force }
     $allowedRoots = @("SKILL.md", "agents", "scripts", "templates")
-    $files = foreach ($root in $allowedRoots) {
-        $path = Join-Path $SkillRoot $root
-        if (Test-Path -LiteralPath $path -PathType Leaf) {
-            Get-Item -LiteralPath $path
-        }
-        elseif (Test-Path -LiteralPath $path -PathType Container) {
-            Get-ChildItem -LiteralPath $path -Recurse -File | Where-Object {
-                (-not ($_.Name -like "*.local.*" -and $_.Name -notlike "*.tpl")) -and
-                $_.Name -ne "deepseek-proxy.log.jsonl" -and
-                $_.FullName -notmatch '\\backups\\'
+    $stageRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-deepseek-subagents-export-" + [System.Guid]::NewGuid().ToString("N"))
+    $stageSkillRoot = Join-Path $stageRoot "codex-deepseek-subagents"
+    try {
+        New-Item -ItemType Directory -Path $stageSkillRoot -Force | Out-Null
+        foreach ($root in $allowedRoots) {
+            $path = Join-Path $SkillRoot $root
+            $target = Join-Path $stageSkillRoot $root
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                Copy-Item -LiteralPath $path -Destination $target -Force
+            }
+            elseif (Test-Path -LiteralPath $path -PathType Container) {
+                Get-ChildItem -LiteralPath $path -Recurse -File | Where-Object {
+                    (-not ($_.Name -like "*.local.*" -and $_.Name -notlike "*.tpl")) -and
+                    $_.Name -ne "deepseek-proxy.log.jsonl" -and
+                    $_.FullName -notmatch '\\backups\\'
+                } | ForEach-Object {
+                    $relative = $_.FullName.Substring($path.Length).TrimStart('\', '/')
+                    $targetFile = Join-Path $target $relative
+                    New-Item -ItemType Directory -Path (Split-Path -Parent $targetFile) -Force | Out-Null
+                    Copy-Item -LiteralPath $_.FullName -Destination $targetFile -Force
+                }
             }
         }
+        $archiveItems = Get-ChildItem -LiteralPath $stageSkillRoot -Force
+        Compress-Archive -LiteralPath @($archiveItems | ForEach-Object { $_.FullName }) -DestinationPath $destination -Force
     }
-    Compress-Archive -LiteralPath @($files | ForEach-Object { $_.FullName }) -DestinationPath $destination -Force
+    finally {
+        if (Test-Path -LiteralPath $stageRoot) { Remove-Item -LiteralPath $stageRoot -Recurse -Force }
+    }
     Write-Step "Exported shareable skill zip: $destination"
 }
 
-switch ($Command) {
-    "install" { Install-OrUpdate -IsUpdate $false }
-    "update" { Install-OrUpdate -IsUpdate $true }
-    "uninstall" { Uninstall-Project }
-    "doctor" { Invoke-Doctor }
-    "desktop-doctor" { Invoke-DesktopDoctor }
-    "delegate" { Invoke-Delegate }
-    "start-proxy" { Start-Proxy }
-    "stop-proxy" { Stop-Proxy }
-    "test-proxy" { Test-Proxy }
-    "usage" { Show-Usage }
-    "redact" { Invoke-RedactCheck }
-    "export-shareable" { Export-Shareable }
+if ($MyInvocation.InvocationName -ne '.') {
+    switch ($Command) {
+        "install" { Install-OrUpdate -IsUpdate $false }
+        "update" { Install-OrUpdate -IsUpdate $true }
+        "uninstall" { Uninstall-Project }
+        "doctor" { Invoke-Doctor }
+        "desktop-doctor" { Invoke-DesktopDoctor }
+        "delegate" { Invoke-Delegate }
+        "start-proxy" { Start-Proxy }
+        "stop-proxy" { Stop-Proxy }
+        "test-proxy" { Test-Proxy }
+        "usage" { Show-Usage }
+        "redact" { Invoke-RedactCheck }
+        "export-shareable" { Export-Shareable }
+    }
 }
