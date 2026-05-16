@@ -269,6 +269,10 @@ def print_json(data):
     sys.stdout.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
+def print_compact_json(data):
+    sys.stdout.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
 def command_doctor(args):
     project_root = Path(args.project_root).resolve()
     install_state, existing, legacy = detect_install_state(project_root)
@@ -429,7 +433,7 @@ def command_test_runtime(args):
     })
     if args.json:
         usage = response.get("usage") or {}
-        print_json({
+        print_compact_json({
             "id": response.get("id"),
             "status": response.get("status"),
             "model": response.get("model"),

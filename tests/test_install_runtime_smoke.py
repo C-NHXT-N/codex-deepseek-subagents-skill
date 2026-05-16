@@ -107,6 +107,19 @@ def wait_for_health(base_url, runtime=None):
     raise AssertionError("runtime did not become healthy")
 
 
+def parse_json_stdout(stdout):
+    text = stdout.strip()
+    if not text:
+        raise AssertionError("expected JSON stdout, got empty output")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        if start == -1:
+            raise
+        return json.loads(text[start:])
+
+
 class InstalledRuntimeSmokeTests(unittest.TestCase):
     @unittest.skipIf(shutil.which("bash") is None, "bash is required for install smoke test")
     def test_bash_install_runtime_health_agents_text_and_native_tool_flow(self):
@@ -196,7 +209,7 @@ class InstalledRuntimeSmokeTests(unittest.TestCase):
                     stderr=subprocess.PIPE,
                     check=True,
                 )
-                test_runtime_data = json.loads(test_runtime.stdout.strip().splitlines()[-1])
+                test_runtime_data = parse_json_stdout(test_runtime.stdout)
                 self.assertTrue(test_runtime_data["contains_runtime_ok"])
 
                 with urllib.request.urlopen(f"{base}/v1/agents", timeout=2) as res:
@@ -277,7 +290,7 @@ class InstalledRuntimeSmokeTests(unittest.TestCase):
                     check=True,
                     env=env,
                 )
-                analyze_data = json.loads(analyze.stdout)
+                analyze_data = parse_json_stdout(analyze.stdout)
                 self.assertEqual(analyze_data["route"]["display_label"], "deepseek-v4-pro(thinking)")
                 self.assertEqual(analyze_data["content"], "install-native-ok")
             finally:
@@ -367,7 +380,7 @@ class InstalledRuntimeSmokeTests(unittest.TestCase):
                     stderr=subprocess.PIPE,
                     check=True,
                 )
-                test_runtime_data = json.loads(test_runtime.stdout.strip().splitlines()[-1])
+                test_runtime_data = parse_json_stdout(test_runtime.stdout)
                 self.assertTrue(test_runtime_data["contains_runtime_ok"])
 
                 task_req = urllib.request.Request(
