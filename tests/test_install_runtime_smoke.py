@@ -281,6 +281,7 @@ class InstalledRuntimeSmokeTests(unittest.TestCase):
                         "Analyze README.md only and return a short result.",
                         "--paths",
                         "README.md",
+                        "--yes",
                         "--json",
                     ],
                     cwd=str(root),
