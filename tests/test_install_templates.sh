@@ -24,6 +24,14 @@ required=(
   ".codex/deepseek.local.env.ps1"
   ".codex/runtime/deepseek_scheduler.py"
   ".codex/runtime/deepseek_runtime.py"
+  ".codex/runtime/deepseek_client.py"
+  ".codex/runtime/events.py"
+  ".codex/runtime/render.py"
+  ".codex/runtime/patch_preview.py"
+  ".codex/runtime/tool_protocol.py"
+  ".codex/runtime/usage.py"
+  ".codex/runtime/doctor.py"
+  ".codex/runtime/tui.py"
   ".codex/runtime/task_queue.json"
   ".codex/runtime/sessions.json"
   ".codex/runtime/events.log.jsonl"
@@ -36,6 +44,11 @@ required=(
 for rel in "${required[@]}"; do
   test -f "$tmp/$rel"
 done
+
+grep -q -- '--thinking-view' "$script"
+grep -q -- '--patch-view' "$script"
+grep -q 'tui()' "$script"
+grep -q 'runtime_cli tui' "$script"
 
 cat > "$tmp/.codex/test-responses-proxy.sh" <<'EOF'
 #!/usr/bin/env bash

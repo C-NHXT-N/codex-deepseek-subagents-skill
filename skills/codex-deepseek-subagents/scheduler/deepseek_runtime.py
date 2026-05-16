@@ -18,6 +18,12 @@ if str(RUNTIME_DIR) not in sys.path:
     sys.path.insert(0, str(RUNTIME_DIR))
 
 import deepseek_scheduler as scheduler
+from doctor import build_doctor_report, render_doctor_report
+from render import render_permission_card as render_scope_card
+from render import render_status_card as render_status_box
+from render import StreamCliRenderer, render_patch_block
+from tui import DashboardState, render_dashboard, render_runtime_dashboard_snapshot, tui_support_reason
+from usage import load_usage_rows, render_usage, summarize_usage
 
 
 def project_path(project_root, relative):
@@ -259,10 +265,17 @@ def render_events(events, verbose=True):
     return lines
 
 
-def maybe_confirm(auto_yes):
-    if auto_yes or not sys.stdin.isatty():
-        return
+def maybe_confirm(auto_yes, required=False):
+    if auto_yes:
+        return True
+    if not required:
+        return True
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "Confirmation required but stdin is not interactive. Re-run with --yes after reviewing the displayed scope."
+        )
     input("Press Enter to continue or Ctrl+C to abort...")
+    return True
 
 
 def print_json(data):
@@ -273,48 +286,201 @@ def print_compact_json(data):
     sys.stdout.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
+def get_default_mode_from_config(project_root):
+    config_path = project_path(project_root, "user_config.json")
+    if not config_path.exists():
+        return "pro-thinking"
+    try:
+        config = scheduler.validate_user_config(json.loads(config_path.read_text(encoding="utf-8-sig")))
+    except Exception:
+        return "pro-thinking"
+    execution_name = config["defaults"]["execution_agent"]
+    for agent in config["connected_agents"]:
+        if agent["name"] == execution_name:
+            return str((agent.get("defaults") or {}).get("mode") or "pro-thinking")
+    return "pro-thinking"
+
+
+def resolve_mode(args, project_root):
+    if args.mode is not None:
+        return args.mode
+    default_mode = get_default_mode_from_config(project_root)
+    if args.model is not None or args.thinking is not None:
+        model_family = args.model or ("flash" if "flash" in default_mode else "pro")
+        thinking_enabled = args.thinking or ("on" if "thinking" in default_mode else "off")
+        requested_model_name = os.environ.get("DEEPSEEK_OPENAI_FAST_MODEL") if model_family == "flash" else os.environ.get("DEEPSEEK_OPENAI_MODEL")
+        effort = "high" if thinking_enabled == "on" else "disabled"
+    else:
+        requested_model_name = None
+        effort = None
+    return scheduler.select_mode(
+        requested_mode=None,
+        requested_model=requested_model_name,
+        effort=effort,
+        default_mode=default_mode,
+    )
+
+
+def format_elapsed(start_monotonic):
+    elapsed = max(0, int(time.monotonic() - start_monotonic))
+    return f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+
+
+class TuiRenderer:
+    def __init__(self, out_stream, thinking_view="hidden", patch_view="summary"):
+        self.out_stream = out_stream
+        self.thinking_view = thinking_view
+        self.patch_view = patch_view
+        self.state = DashboardState()
+
+    def redraw(self):
+        self.out_stream.write("\x1b[?1049h\x1b[2J\x1b[H")
+        self.out_stream.write("\n".join(render_dashboard(self.state)) + "\n")
+        self.out_stream.flush()
+
+    def print_block(self, lines):
+        self.state.scope = [str(line) for line in lines]
+        self.redraw()
+
+    def render_header(self, route, mode_label, status):
+        self.state.header = [
+            f"Model: {route['display_label']}",
+            f"Mode: {mode_label}",
+            f"Status: {status}",
+            f"Thinking: {'ON' if route['thinking_type'] == 'enabled' else 'OFF'}",
+            "Shell: disabled",
+        ]
+        self.redraw()
+
+    def render_scope(self, lines):
+        self.state.scope = [str(line) for line in lines]
+        self.redraw()
+
+    def render_event(self, event):
+        self.state.apply(event, thinking_view=self.thinking_view, patch_view=self.patch_view)
+        self.redraw()
+
+    def close(self):
+        self.out_stream.write("\x1b[?1049l")
+        self.out_stream.flush()
+
+
+def build_renderer(args):
+    if args.ui == "tui":
+        reason = tui_support_reason()
+        if reason:
+            print(f"TUI is not available in this terminal. Falling back to stream-cli. Reason: {reason}")
+            return StreamCliRenderer(sys.stdout, thinking_view=args.thinking_view, patch_view=args.patch_view)
+        return TuiRenderer(sys.stdout, thinking_view=args.thinking_view, patch_view=args.patch_view)
+    return StreamCliRenderer(sys.stdout, thinking_view=args.thinking_view, patch_view=args.patch_view)
+
+
+def print_route_and_scope(renderer, route, mode_label, summary, read_paths, write_paths, tools):
+    if isinstance(renderer, TuiRenderer):
+        renderer.render_header(route, mode_label, "routing")
+        renderer.render_scope(render_scope_card(summary, read_paths, write_paths, tools, "DeepSeek endpoint"))
+        return
+    renderer.print_block(render_status_box(route, mode_label, "routing"))
+    renderer.print_block(render_scope_card(summary, read_paths, write_paths, tools, "DeepSeek endpoint"))
+
+
+def make_live_event_sink(renderer, start_monotonic, json_mode=False):
+    events = []
+
+    def event_sink(event):
+        event.setdefault("data", {})
+        event["data"]["_elapsed"] = format_elapsed(start_monotonic)
+        events.append(event)
+        if not json_mode:
+            renderer.render_event(event)
+
+    return events, event_sink
+
+
+def confirm_patch(auto_yes, patch_view, patch_text):
+    if patch_view in {"summary", "full"}:
+        for line in render_patch_block(patch_text, patch_view):
+            print(line)
+    if auto_yes:
+        return True
+    if not sys.stdin.isatty():
+        raise RuntimeError("Patch application requires confirmation. Re-run with --yes in non-interactive mode.")
+    answer = input("Apply patch? [y/N]\n").strip().lower()
+    return answer in {"y", "yes"}
+
+
 def command_doctor(args):
     project_root = Path(args.project_root).resolve()
     install_state, existing, legacy = detect_install_state(project_root)
-    report = {
-        "project_root": str(project_root),
-        "install_state": install_state,
-        "user_config_exists": existing["user_config"],
-        "config_exists": existing["config"],
-        "worker_exists": existing["worker"],
-        "env_exists": existing["env"],
-        "runtime_entry_exists": existing["runtime"],
-        "stale_legacy_artifacts": legacy,
-    }
+    state = None
+    user_config_valid = None
     if existing["user_config"]:
         try:
             state = load_state(project_root, port_override=args.port)
-            report["user_config_valid"] = True
-            report["agent_registry_summary"] = [
-                {"name": agent["name"], "kind": agent["kind"], "endpoint": agent["endpoint"]}
-                for agent in state.config["connected_agents"]
-                if agent.get("enabled", True)
-            ]
-            report["collaboration_capabilities"] = scheduler.runtime_capabilities()
-            report["runtime_ready"] = True
-            report["route_display_ready"] = True
-            report["interactive_cli_ready"] = True
-            report["reasoning_stream_ready"] = True
-            report["native_tool_agent_ready"] = True
+            user_config_valid = True
         except Exception as exc:
-            report["user_config_valid"] = False
-            report["user_config_error"] = str(exc)
+            user_config_valid = False
+            state = None
+            user_config_error = str(exc)
+    else:
+        user_config_error = ""
     pid = read_pid(project_root)
-    report["runtime_pid_exists"] = pid is not None
-    report["runtime_process_alive"] = process_alive(pid)
+    runtime_health = None
+    runtime_health_error = ""
     try:
         base_url = runtime_base_url(project_root, args.port)
         with urllib.request.urlopen(base_url.rstrip("/v1") + "/healthz", timeout=2) as res:
-            report["runtime_health"] = json.loads(res.read().decode("utf-8"))
+            runtime_health = json.loads(res.read().decode("utf-8"))
     except Exception as exc:
-        report["runtime_health_error"] = str(exc)
-        report["runtime_health_error_category"] = scheduler.classify_error(exc)
-    print_json(report)
+        runtime_health_error = str(exc)
+    deep_checks = {}
+    if args.deep and state is not None:
+        try:
+            response = runtime_request(project_root, {
+                "model": os.environ.get("DEEPSEEK_OPENAI_MODEL"),
+                "input": [{"role": "user", "content": "say ok"}],
+                "metadata": {"deepseek_reasoning_effort": "disabled"},
+                "max_output_tokens": 16,
+            })
+            deep_checks["direct_text_smoke"] = response.get("status") == "completed"
+            stream_req = urllib.request.Request(
+                runtime_base_url(project_root, args.port).rstrip("/") + "/responses",
+                data=json.dumps({
+                    "model": os.environ.get("DEEPSEEK_OPENAI_MODEL"),
+                    "input": [{"role": "user", "content": "say ok"}],
+                    "metadata": {"deepseek_reasoning_effort": "disabled"},
+                    "stream": True,
+                    "max_output_tokens": 16,
+                }).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer " + os.environ.get("DEEPSEEK_PROXY_API_KEY", ""),
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(stream_req, timeout=5) as res:
+                stream_body = res.read().decode("utf-8")
+            deep_checks["sse_stream_smoke"] = "event: route.selected" in stream_body
+            deep_checks["native_tool_smoke"] = "skipped"
+        except Exception as exc:
+            deep_checks["deep_error"] = str(exc)
+    report = build_doctor_report(
+        install_state=install_state,
+        existing=existing,
+        runtime_health=runtime_health,
+        runtime_health_error=runtime_health_error or user_config_error,
+        user_config_valid=user_config_valid,
+        pid_exists=pid is not None,
+        process_alive=process_alive(pid),
+        deep_checks=deep_checks,
+        stale_legacy_artifacts=legacy,
+    )
+    report["project_root"] = str(project_root)
+    if args.json:
+        print_json(report)
+    else:
+        for line in render_doctor_report(report):
+            print(line)
 
 
 def command_start_runtime(args):
@@ -452,7 +618,7 @@ def command_test_runtime(args):
         "thinking_type": "enabled" if "thinking" in str(response.get("model_label") or "") else "disabled",
         "display_label": response.get("model_label") or response.get("model"),
     }
-    for line in render_status_card(route, "test-runtime", response.get("status")):
+    for line in render_status_box(route, "test-runtime", response.get("status")):
         print(line)
     print(f"[DeepSeek] Output: {response.get('output_text')}")
 
@@ -465,26 +631,21 @@ def command_delegate(args):
         prompt = Path(args.prompt_file).read_text(encoding="utf-8")
     if not prompt.strip():
         raise RuntimeError("delegate requires --prompt or --prompt-file")
-    selected_mode = scheduler.select_mode(
-        requested_mode=args.mode,
-        requested_model=os.environ.get("DEEPSEEK_OPENAI_FAST_MODEL") if str(args.model).strip() == "flash" else os.environ.get("DEEPSEEK_OPENAI_MODEL"),
-        effort="high" if args.thinking == "on" else "disabled",
-        default_mode=args.mode,
-    )
+    selected_mode = resolve_mode(args, project_root)
     route = scheduler.build_route(selected_mode)
+    renderer = build_renderer(args)
     if not args.json:
-        for line in render_status_card(route, "text_delegate", "routing"):
-            print(line)
-        for line in render_permission_card(prompt[:240], [], [], route):
-            print(line)
-    maybe_confirm(args.yes)
-    events = []
+        print_route_and_scope(renderer, route, "text_delegate", prompt[:240], [], [], [])
+    maybe_confirm(args.yes, required=False)
+    start_monotonic = time.monotonic()
+    events, event_sink = make_live_event_sink(renderer, start_monotonic, json_mode=args.json)
+    scheduler.emit_event(event_sink, "scope.presented", step="scope", message="Scope presented to user.", route=route)
     turn = scheduler.run_text_turn(
         [{"role": "user", "content": prompt}],
         selected_mode=selected_mode,
         max_tokens=args.max_tokens,
         retry={"max_attempts": 3, "backoff_seconds": 1},
-        event_sink=events.append,
+        event_sink=event_sink,
     )
     if args.json:
         print_json({
@@ -495,27 +656,22 @@ def command_delegate(args):
             "events": events,
         })
         return
-    for line in render_events(events, verbose=args.verbose):
-        print(line)
+    if isinstance(renderer, TuiRenderer):
+        renderer.close()
 
 
 def command_analyze(args):
     project_root = Path(args.project_root).resolve()
-    state = load_state(project_root, port_override=args.port)
+    load_project_env(project_root)
     prompt = args.prompt or "Analyze this repository and explain architecture, key modules, risks, and recommendations."
     allowed_paths = args.paths or ["."]
-    selected_mode = scheduler.select_mode(
-        requested_mode=args.mode,
-        requested_model=os.environ.get("DEEPSEEK_OPENAI_FAST_MODEL") if str(args.model).strip() == "flash" else os.environ.get("DEEPSEEK_OPENAI_MODEL"),
-        effort="high" if args.thinking == "on" else "disabled",
-        default_mode=args.mode,
-    )
+    selected_mode = resolve_mode(args, project_root)
     route = scheduler.build_route(selected_mode)
+    renderer = build_renderer(args)
     if not args.json:
-        for line in render_status_card(route, "analyze", "routing"):
-            print(line)
-        for line in render_permission_card(prompt, allowed_paths, ["repo_list_files", "repo_read_file", "repo_search_text"], route):
-            print(line)
+        print_route_and_scope(renderer, route, "analyze", prompt, allowed_paths, [], ["repo_list_files", "repo_read_file", "repo_search_text"])
+    maybe_confirm(args.yes, required=True)
+    state = load_state(project_root, port_override=args.port)
     task = state.create_task({
         "type": "execution",
         "description": "Read-only repository analysis",
@@ -535,8 +691,10 @@ def command_analyze(args):
         },
     })
     approved = state.approve_task(task["task_id"], {"approval_token": "approved-by-user", "approval_note": "analyze command"})
-    maybe_confirm(args.yes)
-    events = []
+    start_monotonic = time.monotonic()
+    events, event_sink = make_live_event_sink(renderer, start_monotonic, json_mode=args.json)
+    scheduler.emit_event(event_sink, "scope.presented", step="scope", message="Scope presented to user.", route=route, task_id=task["task_id"])
+    scheduler.emit_event(event_sink, "approval.confirmed", step="approval", message="Read-only repo analysis approved.", route=route, task_id=task["task_id"])
     turn = scheduler.run_native_tool_turn(
         state,
         approved,
@@ -544,7 +702,8 @@ def command_analyze(args):
         [{"role": "user", "content": prompt}],
         args.max_tokens,
         selected_mode,
-        event_sink=events.append,
+        event_sink=event_sink,
+        patch_confirm=lambda _task, _summary, patch_text: confirm_patch(args.yes, args.patch_view, patch_text),
     )
     if args.json:
         print_json({
@@ -556,28 +715,82 @@ def command_analyze(args):
             "task_id": task["task_id"],
         })
         return
-    for line in render_events(events, verbose=args.verbose):
+    if isinstance(renderer, TuiRenderer):
+        renderer.close()
+
+
+def command_usage(args):
+    project_root = Path(args.project_root).resolve()
+    rows = load_usage_rows(project_path(project_root, ".codex/runtime/events.log.jsonl"))
+    summary = summarize_usage(rows)
+    if args.json:
+        print_json(summary)
+        return
+    for line in render_usage(summary):
         print(line)
+
+
+def command_tui(args):
+    project_root = Path(args.project_root).resolve()
+    reason = tui_support_reason()
+    if reason:
+        print(f"TUI is not available in this terminal. Falling back to stream-cli. Reason: {reason}")
+        doctor_args = argparse.Namespace(project_root=str(project_root), port=args.port, json=False, deep=False)
+        return command_doctor(doctor_args)
+    sessions_path = project_path(project_root, ".codex/runtime/sessions.json")
+    recent_sessions = []
+    active_session = None
+    if sessions_path.exists():
+        try:
+            payload = json.loads(sessions_path.read_text(encoding="utf-8-sig"))
+            recent_sessions = payload.get("sessions") or []
+            for session in reversed(recent_sessions):
+                if session.get("status") not in {"completed", "failed"}:
+                    active_session = session
+                    break
+        except Exception:
+            recent_sessions = []
+    install_state, existing, legacy = detect_install_state(project_root)
+    pid = read_pid(project_root)
+    doctor_report = build_doctor_report(
+        install_state=install_state,
+        existing=existing,
+        runtime_health=None,
+        user_config_valid=existing.get("user_config", False),
+        pid_exists=pid is not None,
+        process_alive=process_alive(pid),
+        stale_legacy_artifacts=legacy,
+    )
+    lines = render_runtime_dashboard_snapshot(active_session=active_session, doctor_summary=render_doctor_report(doctor_report), recent_sessions=recent_sessions)
+    print("\x1b[?1049h\x1b[2J\x1b[H" + "\n".join(lines))
+    try:
+        input("\nPress Enter to exit TUI dashboard...")
+    finally:
+        print("\x1b[?1049l", end="")
 
 
 def build_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["doctor", "start-runtime", "stop-runtime", "test-runtime", "test-proxy", "delegate", "analyze"])
+    parser.add_argument("command", choices=["doctor", "start-runtime", "stop-runtime", "test-runtime", "test-proxy", "delegate", "analyze", "usage", "tui"])
     parser.add_argument("--project-root", default=".")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--prompt", default="")
     parser.add_argument("--prompt-file", default="")
-    parser.add_argument("--mode", default="pro-thinking", choices=list(scheduler.SUPPORTED_MODES))
-    parser.add_argument("--model", default="pro", choices=["flash", "pro"])
-    parser.add_argument("--thinking", default="on", choices=["on", "off"])
+    parser.add_argument("--mode", default=None, choices=list(scheduler.SUPPORTED_MODES))
+    parser.add_argument("--model", default=None, choices=["flash", "pro"])
+    parser.add_argument("--thinking", default=None, choices=["on", "off"])
+    parser.add_argument("--thinking-view", default="hidden", choices=["hidden", "summary", "raw"])
+    parser.add_argument("--patch-view", default="summary", choices=["hidden", "summary", "full"])
+    parser.add_argument("--ui", default="stream", choices=["stream", "tui"])
     parser.add_argument("--verbose", dest="verbose", action="store_true")
     parser.add_argument("--quiet", dest="verbose", action="store_false")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--deep", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--max-tool-steps", type=int, default=8)
     parser.add_argument("--paths", nargs="*", default=None)
-    parser.set_defaults(verbose=True)
+    parser.set_defaults(verbose=False)
     return parser
 
 
@@ -596,6 +809,10 @@ def main():
         return command_delegate(args)
     if args.command == "analyze":
         return command_analyze(args)
+    if args.command == "usage":
+        return command_usage(args)
+    if args.command == "tui":
+        return command_tui(args)
 
 
 if __name__ == "__main__":

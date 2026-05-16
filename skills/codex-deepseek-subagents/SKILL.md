@@ -23,6 +23,8 @@ After install, prefer the generated local wrappers:
 .\.codex\deepseek-codex.cmd start-runtime
 .\.codex\deepseek-codex.cmd test-runtime
 .\.codex\deepseek-codex.cmd doctor
+.\.codex\deepseek-codex.cmd analyze --prompt "Analyze this repository."
+.\.codex\deepseek-codex.cmd tui
 ```
 
 Linux/macOS:
@@ -32,6 +34,8 @@ bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh install --api-key
 ./.codex/deepseek-codex.sh start-runtime
 ./.codex/deepseek-codex.sh test-runtime
 ./.codex/deepseek-codex.sh doctor
+./.codex/deepseek-codex.sh analyze --prompt "Analyze this repository."
+./.codex/deepseek-codex.sh tui
 ```
 
 Compatibility aliases still exist for `start-proxy`, `stop-proxy`, and `test-proxy`, but the canonical command surface is the runtime naming.
@@ -48,6 +52,14 @@ user_config.json
 .codex/deepseek-codex.sh
 .codex/runtime/deepseek_scheduler.py
 .codex/runtime/deepseek_runtime.py
+.codex/runtime/deepseek_client.py
+.codex/runtime/events.py
+.codex/runtime/render.py
+.codex/runtime/patch_preview.py
+.codex/runtime/tool_protocol.py
+.codex/runtime/usage.py
+.codex/runtime/doctor.py
+.codex/runtime/tui.py
 .codex/runtime/task_queue.json
 .codex/runtime/sessions.json
 .codex/runtime/events.log.jsonl
@@ -116,7 +128,15 @@ Use thinking mode only when the task complexity justifies the extra cost:
 - simple tasks: `pro` or `flash`
 - complex implementation or debugging: `pro-thinking` or `flash-thinking`
 
-Do not persist or replay raw `reasoning_content`.
+Default `--thinking-view` is `hidden`. `summary` only shows local hidden-chars/token metadata. Raw `reasoning_content` is shown only when the user explicitly chooses `--thinking-view raw`, and it must not be persisted or replayed.
+
+## UX Surface
+
+- `delegate` and `analyze` must show a route card and scope card before work is sent.
+- `analyze` is the preferred read-only path and only enables list/read/search repository tools.
+- native patch tasks must show `patch.preview` before `patch.applied`.
+- `tui` opens a runtime dashboard only and must not send a DeepSeek request by itself.
+- if TUI is unavailable in the current terminal, the runtime must print a fallback message and continue with `stream-cli`.
 
 ## Maintenance
 

@@ -13,6 +13,20 @@ if ($parseErrors.Count -gt 0) {
 
 . $script
 
+$scriptText = Get-Content -Raw $script
+foreach ($needle in @(
+    'tui',
+    '--thinking-view',
+    '--patch-view',
+    '--deep',
+    'Invoke-RuntimeCli -RuntimeCommand "usage"',
+    'Invoke-RuntimeCli -RuntimeCommand "tui"'
+)) {
+    if ($scriptText -notmatch [regex]::Escape($needle)) {
+        throw "PowerShell wrapper is missing expected runtime surface: $needle"
+    }
+}
+
 $unixCases = @(
     @{ Root = "/repo"; Full = "/repo/.git/objects/aa"; Name = "aa"; ShouldScan = $false },
     @{ Root = "/repo"; Full = "/repo/backups/file.txt"; Name = "file.txt"; ShouldScan = $false },
@@ -52,6 +66,14 @@ try {
         ".codex/deepseek.local.env.sh",
         ".codex/runtime/deepseek_scheduler.py",
         ".codex/runtime/deepseek_runtime.py",
+        ".codex/runtime/deepseek_client.py",
+        ".codex/runtime/events.py",
+        ".codex/runtime/render.py",
+        ".codex/runtime/patch_preview.py",
+        ".codex/runtime/tool_protocol.py",
+        ".codex/runtime/usage.py",
+        ".codex/runtime/doctor.py",
+        ".codex/runtime/tui.py",
         ".codex/runtime/task_queue.json",
         ".codex/runtime/sessions.json",
         ".codex/runtime/events.log.jsonl",

@@ -9,6 +9,7 @@ PROJECT_ROOT="$(pwd)"
 API_KEY=""
 MODEL="deepseek-v4-pro"
 FAST_MODEL="deepseek-v4-flash"
+TASK_MODEL=""
 BASE_URL="https://api.deepseek.com"
 ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
 PORT="4000"
@@ -19,11 +20,17 @@ NO_BACKUP=0
 FORCE=0
 REMOVE_SKILL=0
 OUT_FILE=""
-MODE="pro-thinking"
+MODE=""
+THINKING=""
 THINKING_VIEW="hidden"
+PATCH_VIEW="summary"
+UI="stream"
 PROMPT=""
 PROMPT_FILE=""
 MAX_TOKENS="2048"
+JSON=0
+YES=0
+DEEP=0
 MANAGED_MARKER="# Managed by codex-deepseek-subagents"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -36,7 +43,7 @@ Usage: deepseek-codex.sh <command> [options]
 
 Commands:
   install, update, uninstall, doctor, delegate, analyze,
-  start-runtime, stop-runtime, test-runtime,
+  start-runtime, stop-runtime, test-runtime, tui,
   usage, redact, export-shareable
 
 Compatibility aliases:
@@ -52,9 +59,15 @@ Options:
   --port PORT
   --thinking-default disabled|high|max
   --mode pro-thinking|flash-thinking|pro|flash
+  --thinking on|off
   --thinking-view hidden|summary|raw
+  --patch-view hidden|summary|full
+  --ui stream|tui
   --prompt TEXT
   --prompt-file PATH
+  --json
+  --yes
+  --deep
   --max-tokens N
   --dry-run
   --no-backup
@@ -68,16 +81,29 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --project-root|-ProjectRoot) PROJECT_ROOT="$2"; shift 2 ;;
     --api-key|-ApiKey) API_KEY="$2"; shift 2 ;;
-    --model|-Model) MODEL="$2"; shift 2 ;;
+    --model|-Model)
+      if [[ "$2" == "flash" || "$2" == "pro" ]]; then
+        TASK_MODEL="$2"
+      else
+        MODEL="$2"
+      fi
+      shift 2
+      ;;
     --fast-model|-FastModel) FAST_MODEL="$2"; shift 2 ;;
     --base-url|-BaseUrl) BASE_URL="$2"; shift 2 ;;
     --anthropic-base-url|-AnthropicBaseUrl) ANTHROPIC_BASE_URL="$2"; shift 2 ;;
     --port|-Port) PORT="$2"; PORT_EXPLICIT=1; shift 2 ;;
     --thinking-default|-ThinkingDefault) THINKING_DEFAULT="$2"; shift 2 ;;
     --mode|-Mode) MODE="$2"; shift 2 ;;
+    --thinking) THINKING="$2"; shift 2 ;;
     --thinking-view|-ThinkingView) THINKING_VIEW="$2"; shift 2 ;;
+    --patch-view) PATCH_VIEW="$2"; shift 2 ;;
+    --ui) UI="$2"; shift 2 ;;
     --prompt|-Prompt) PROMPT="$2"; shift 2 ;;
     --prompt-file|-PromptFile) PROMPT_FILE="$2"; shift 2 ;;
+    --json) JSON=1; shift ;;
+    --yes) YES=1; shift ;;
+    --deep) DEEP=1; shift ;;
     --max-tokens|-MaxTokens) MAX_TOKENS="$2"; shift 2 ;;
     --dry-run|-DryRun) DRY_RUN=1; shift ;;
     --no-backup|-NoBackup) NO_BACKUP=1; shift ;;
@@ -135,7 +161,8 @@ expand_template() {
 
 expand_scheduler_source() {
   local relative="$1"
-  sed \
+  local content
+  content="$(sed \
     -e "s|__API_KEY_SH__|$(sq "$API_KEY")|g" \
     -e "s|__BASE_URL_SH__|$(sq "$BASE_URL")|g" \
     -e "s|__ANTHROPIC_BASE_URL_SH__|$(sq "$ANTHROPIC_BASE_URL")|g" \
@@ -143,7 +170,12 @@ expand_scheduler_source() {
     -e "s|__FAST_MODEL_SH__|$(sq "$FAST_MODEL")|g" \
     -e "s|__THINKING_DEFAULT_SH__|$(sq "$THINKING_DEFAULT")|g" \
     -e "s|__PORT__|$PORT|g" \
-    "$SCHEDULER_ROOT/$relative"
+    "$SCHEDULER_ROOT/$relative")"
+  if [[ "$content" != \#\ Managed\ by\ codex-deepseek-subagents* ]]; then
+    printf '# Managed by codex-deepseek-subagents\n%s' "$content"
+  else
+    printf '%s' "$content"
+  fi
 }
 
 is_managed_file() {
@@ -214,6 +246,9 @@ from pathlib import Path
 template_path = Path(sys.argv[1])
 existing_path = Path(sys.argv[2])
 scheduler_path = Path(sys.argv[3])
+scheduler_dir = str(scheduler_path.parent)
+if scheduler_dir not in sys.path:
+    sys.path.insert(0, scheduler_dir)
 
 template = json.loads(template_path.read_text(encoding="utf-8"))
 existing = {}
@@ -393,6 +428,14 @@ install_or_update() {
   write_managed_file "$(project_path ".codex/deepseek.local.env.ps1")" "$(powershell_template_or_comment)" 1
   write_managed_file "$(project_path ".codex/runtime/deepseek_scheduler.py")" "$(expand_scheduler_source "deepseek_scheduler.py")"
   write_managed_file "$(project_path ".codex/runtime/deepseek_runtime.py")" "$(expand_scheduler_source "deepseek_runtime.py")"
+  write_managed_file "$(project_path ".codex/runtime/deepseek_client.py")" "$(expand_scheduler_source "deepseek_client.py")"
+  write_managed_file "$(project_path ".codex/runtime/events.py")" "$(expand_scheduler_source "events.py")"
+  write_managed_file "$(project_path ".codex/runtime/render.py")" "$(expand_scheduler_source "render.py")"
+  write_managed_file "$(project_path ".codex/runtime/patch_preview.py")" "$(expand_scheduler_source "patch_preview.py")"
+  write_managed_file "$(project_path ".codex/runtime/tool_protocol.py")" "$(expand_scheduler_source "tool_protocol.py")"
+  write_managed_file "$(project_path ".codex/runtime/usage.py")" "$(expand_scheduler_source "usage.py")"
+  write_managed_file "$(project_path ".codex/runtime/doctor.py")" "$(expand_scheduler_source "doctor.py")"
+  write_managed_file "$(project_path ".codex/runtime/tui.py")" "$(expand_scheduler_source "tui.py")"
   write_managed_file "$(project_path ".codex/test-runtime.sh")" "$(expand_template "test-runtime.sh.tpl")"
   write_managed_file "$(project_path ".codex/test-runtime.ps1")" "$(powershell_runtime_test_template_or_comment)"
   write_managed_file "$(project_path ".codex/deepseek-codex.cmd")" "$(powershell_expand_template "deepseek-codex.cmd.tpl")"
@@ -459,6 +502,14 @@ uninstall_project() {
     ".codex/deepseek.local.env.ps1"
     ".codex/runtime/deepseek_scheduler.py"
     ".codex/runtime/deepseek_runtime.py"
+    ".codex/runtime/deepseek_client.py"
+    ".codex/runtime/events.py"
+    ".codex/runtime/render.py"
+    ".codex/runtime/patch_preview.py"
+    ".codex/runtime/tool_protocol.py"
+    ".codex/runtime/usage.py"
+    ".codex/runtime/doctor.py"
+    ".codex/runtime/tui.py"
     ".codex/test-runtime.sh"
     ".codex/test-runtime.ps1"
     ".codex/deepseek-codex.cmd"
@@ -565,20 +616,33 @@ reuse_api_key_from_managed_env() {
 }
 
 doctor() {
-  runtime_cli doctor
+  local args=(doctor)
+  [[ "$DEEP" == "1" ]] && args+=(--deep)
+  [[ "$JSON" == "1" ]] && args+=(--json)
+  runtime_cli "${args[@]}"
 }
 
 delegate() {
-  local args=(delegate --mode "$MODE" --max-tokens "$MAX_TOKENS")
+  local args=(delegate --max-tokens "$MAX_TOKENS" --thinking-view "$THINKING_VIEW" --patch-view "$PATCH_VIEW" --ui "$UI")
+  [[ -n "$TASK_MODEL" ]] && args+=(--model "$TASK_MODEL")
+  [[ -n "$THINKING" ]] && args+=(--thinking "$THINKING")
+  [[ -n "$MODE" ]] && args+=(--mode "$MODE")
   [[ -n "$PROMPT" ]] && args+=(--prompt "$PROMPT")
   [[ -n "$PROMPT_FILE" ]] && args+=(--prompt-file "$PROMPT_FILE")
-  [[ "$THINKING_VIEW" == "raw" ]] && args+=(--verbose)
+  [[ "$JSON" == "1" ]] && args+=(--json)
+  [[ "$YES" == "1" ]] && args+=(--yes)
   runtime_cli "${args[@]}"
 }
 
 analyze() {
-  local args=(analyze --mode "$MODE" --max-tokens "$MAX_TOKENS" --yes)
+  local args=(analyze --max-tokens "$MAX_TOKENS" --thinking-view "$THINKING_VIEW" --patch-view "$PATCH_VIEW" --ui "$UI")
+  [[ -n "$TASK_MODEL" ]] && args+=(--model "$TASK_MODEL")
+  [[ -n "$THINKING" ]] && args+=(--thinking "$THINKING")
+  [[ -n "$MODE" ]] && args+=(--mode "$MODE")
   [[ -n "$PROMPT" ]] && args+=(--prompt "$PROMPT")
+  [[ -n "$PROMPT_FILE" ]] && args+=(--prompt-file "$PROMPT_FILE")
+  [[ "$JSON" == "1" ]] && args+=(--json)
+  [[ "$YES" == "1" ]] && args+=(--yes)
   runtime_cli "${args[@]}"
 }
 
@@ -591,44 +655,25 @@ stop_proxy() {
 }
 
 test_proxy() {
-  runtime_cli test-runtime
+  local args=(test-runtime)
+  [[ "$JSON" == "1" ]] && args+=(--json)
+  runtime_cli "${args[@]}"
 }
 
 test_runtime() {
-  runtime_cli test-runtime
+  local args=(test-runtime)
+  [[ "$JSON" == "1" ]] && args+=(--json)
+  runtime_cli "${args[@]}"
 }
 
 show_usage() {
-  require_command python3
-  local log
-  log="$(project_path ".codex/runtime/events.log.jsonl")"
-  [[ -f "$log" ]] || { step "No usage log found: $log"; return; }
-  python3 - "$log" <<'PY'
-import json, sys
-rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
-def total(key): return sum((row.get(key) or 0) for row in rows)
-groups = {}
-for row in rows:
-    if not row.get("total_tokens"):
-        continue
-    label = row.get("model_label") or (str(row.get("model")) + "(thinking)" if row.get("thinking_type") == "enabled" else row.get("model"))
-    groups.setdefault(label, []).append(row)
-print(json.dumps({
-    "requests": sum(1 for row in rows if row.get("total_tokens")),
-    "prompt_tokens": total("prompt_tokens"),
-    "completion_tokens": total("completion_tokens"),
-    "reasoning_tokens": total("reasoning_tokens"),
-    "total_tokens": total("total_tokens"),
-    "by_model_label": [{
-        "model_label": label,
-        "requests": len(items),
-        "prompt_tokens": sum((row.get("prompt_tokens") or 0) for row in items),
-        "completion_tokens": sum((row.get("completion_tokens") or 0) for row in items),
-        "reasoning_tokens": sum((row.get("reasoning_tokens") or 0) for row in items),
-        "total_tokens": sum((row.get("total_tokens") or 0) for row in items),
-    } for label, items in sorted(groups.items())],
-}, ensure_ascii=False, separators=(",", ":")))
-PY
+  local args=(usage)
+  [[ "$JSON" == "1" ]] && args+=(--json)
+  runtime_cli "${args[@]}"
+}
+
+tui() {
+  runtime_cli tui
 }
 
 redact_check() {
@@ -663,6 +708,7 @@ case "$COMMAND" in
   test-proxy) test_proxy ;;
   test-runtime) test_runtime ;;
   usage) show_usage ;;
+  tui) tui ;;
   redact) redact_check ;;
   export-shareable) export_shareable ;;
   *) echo "Unknown command: $COMMAND" >&2; usage; exit 2 ;;

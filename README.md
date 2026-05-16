@@ -22,6 +22,7 @@ After install, prefer the generated local wrappers:
 .\.codex\deepseek-codex.cmd test-runtime
 .\.codex\deepseek-codex.cmd doctor
 .\.codex\deepseek-codex.cmd analyze --prompt "Analyze this repository."
+.\.codex\deepseek-codex.cmd tui
 ```
 
 Linux/macOS:
@@ -31,6 +32,8 @@ bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh install --api-key
 ./.codex/deepseek-codex.sh start-runtime
 ./.codex/deepseek-codex.sh test-runtime
 ./.codex/deepseek-codex.sh doctor
+./.codex/deepseek-codex.sh analyze --prompt "Analyze this repository."
+./.codex/deepseek-codex.sh tui
 ```
 
 `start-proxy`, `stop-proxy`, and `test-proxy` still work as compatibility aliases, but the project now documents only the runtime naming.
@@ -49,6 +52,14 @@ user_config.json
 .codex/deepseek-codex.sh
 .codex/runtime/deepseek_scheduler.py
 .codex/runtime/deepseek_runtime.py
+.codex/runtime/deepseek_client.py
+.codex/runtime/events.py
+.codex/runtime/render.py
+.codex/runtime/patch_preview.py
+.codex/runtime/tool_protocol.py
+.codex/runtime/usage.py
+.codex/runtime/doctor.py
+.codex/runtime/tui.py
 .codex/runtime/task_queue.json
 .codex/runtime/sessions.json
 .codex/runtime/events.log.jsonl
@@ -95,6 +106,8 @@ Primary commands:
 - `test-runtime`
 - `delegate`
 - `analyze`
+- `tui`
+- `usage`
 
 Maintenance commands still available:
 
@@ -114,6 +127,27 @@ This may send repository content to DeepSeek or the configured proxy. Confirm be
 ```
 
 Default to `listed paths only`. `analyze` is the preferred read-only path and only enables repository listing, reading, and text search.
+
+## What You Will See
+
+Default interaction uses `stream-cli`. Each `delegate` or `analyze` session shows:
+
+- route card: model family, resolved model, thinking state, mode, shell disabled
+- scope card: summary, read/write paths, allowed tools, DeepSeek endpoint
+- live timeline: route selection, approval, reasoning state, tool calls, patch preview, completion
+- usage summary at the end
+
+Useful runtime flags:
+
+- `--thinking-view hidden|summary|raw`
+- `--patch-view hidden|summary|full`
+- `--ui stream|tui`
+- `doctor --deep`
+- `usage --json`
+
+`hidden` is the default thinking view. Raw reasoning is only shown when the user explicitly asks for `--thinking-view raw`, and it is not written to runtime logs or session storage.
+
+`tui` opens a runtime dashboard only. It does not send a DeepSeek request by itself. If there is an active session it shows that session; otherwise it shows runtime status, recent sessions, and a doctor summary. When TUI is unavailable, the runtime prints a clear fallback message and continues with `stream-cli`.
 
 ## Capability Boundary
 

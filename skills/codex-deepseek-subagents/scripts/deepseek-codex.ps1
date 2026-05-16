@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("install", "update", "uninstall", "doctor", "desktop-doctor", "delegate", "analyze", "start-proxy", "stop-proxy", "test-proxy", "test-runtime", "start-runtime", "stop-runtime", "usage", "redact", "export-shareable")]
+    [ValidateSet("install", "update", "uninstall", "doctor", "desktop-doctor", "delegate", "analyze", "start-proxy", "stop-proxy", "test-proxy", "test-runtime", "start-runtime", "stop-runtime", "usage", "tui", "redact", "export-shareable")]
     [string]$Command = "doctor",
 
     [string]$ProjectRoot = (Get-Location).Path,
@@ -17,13 +17,22 @@ param(
     [switch]$Force,
     [switch]$RemoveSkill,
     [ValidateSet("pro-thinking", "flash-thinking", "pro", "flash")]
-    [string]$Mode = "pro-thinking",
+    [string]$Mode = "",
+    [string]$ThinkingModel = "",
+    [string]$Thinking = "",
     [ValidateSet("hidden", "summary", "raw")]
     [string]$ThinkingView = "hidden",
+    [ValidateSet("hidden", "summary", "full")]
+    [string]$PatchView = "summary",
+    [ValidateSet("stream", "tui")]
+    [string]$Ui = "stream",
     [string]$Prompt = "",
     [string]$PromptFile = "",
     [int]$MaxTokens = 2048,
-    [string]$OutFile = ""
+    [string]$OutFile = "",
+    [switch]$Json,
+    [switch]$Yes,
+    [switch]$Deep
 )
 
 $ErrorActionPreference = "Stop"
@@ -102,7 +111,11 @@ function Expand-Template {
 
 function Expand-SchedulerSource {
     param([string]$RelativePath)
-    return Expand-ContentTemplate -Content (Get-Content -Raw (Join-Path $SchedulerRoot $RelativePath))
+    $content = Expand-ContentTemplate -Content (Get-Content -Raw (Join-Path $SchedulerRoot $RelativePath))
+    if ($content -notmatch '^\s*# Managed by codex-deepseek-subagents') {
+        return "# Managed by codex-deepseek-subagents`n$content"
+    }
+    return $content
 }
 
 function Test-ManagedFile {
@@ -196,6 +209,9 @@ from pathlib import Path
 template_path = Path(sys.argv[1])
 existing_path = Path(sys.argv[2])
 scheduler_path = Path(sys.argv[3])
+scheduler_dir = str(scheduler_path.parent)
+if scheduler_dir not in sys.path:
+    sys.path.insert(0, scheduler_dir)
 
 template = json.loads(template_path.read_text(encoding="utf-8-sig"))
 existing = {}
@@ -380,6 +396,14 @@ function Install-OrUpdate {
     Write-ManagedFile (Get-ProjectPath ".codex/deepseek.local.env.sh") (Expand-Template "deepseek.local.env.sh.tpl") -Secret
     Write-ManagedFile (Get-ProjectPath ".codex/runtime/deepseek_scheduler.py") (Expand-SchedulerSource "deepseek_scheduler.py")
     Write-ManagedFile (Get-ProjectPath ".codex/runtime/deepseek_runtime.py") (Expand-SchedulerSource "deepseek_runtime.py")
+    Write-ManagedFile (Get-ProjectPath ".codex/runtime/deepseek_client.py") (Expand-SchedulerSource "deepseek_client.py")
+    Write-ManagedFile (Get-ProjectPath ".codex/runtime/events.py") (Expand-SchedulerSource "events.py")
+    Write-ManagedFile (Get-ProjectPath ".codex/runtime/render.py") (Expand-SchedulerSource "render.py")
+    Write-ManagedFile (Get-ProjectPath ".codex/runtime/patch_preview.py") (Expand-SchedulerSource "patch_preview.py")
+    Write-ManagedFile (Get-ProjectPath ".codex/runtime/tool_protocol.py") (Expand-SchedulerSource "tool_protocol.py")
+    Write-ManagedFile (Get-ProjectPath ".codex/runtime/usage.py") (Expand-SchedulerSource "usage.py")
+    Write-ManagedFile (Get-ProjectPath ".codex/runtime/doctor.py") (Expand-SchedulerSource "doctor.py")
+    Write-ManagedFile (Get-ProjectPath ".codex/runtime/tui.py") (Expand-SchedulerSource "tui.py")
     Write-ManagedFile (Get-ProjectPath ".codex/test-runtime.ps1") (Expand-Template "test-runtime.ps1.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/test-runtime.sh") (Expand-Template "test-runtime.sh.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/deepseek-codex.cmd") (Expand-Template "deepseek-codex.cmd.tpl")
@@ -447,6 +471,14 @@ function Uninstall-Project {
         ".codex/deepseek.local.env.sh",
         ".codex/runtime/deepseek_scheduler.py",
         ".codex/runtime/deepseek_runtime.py",
+        ".codex/runtime/deepseek_client.py",
+        ".codex/runtime/events.py",
+        ".codex/runtime/render.py",
+        ".codex/runtime/patch_preview.py",
+        ".codex/runtime/tool_protocol.py",
+        ".codex/runtime/usage.py",
+        ".codex/runtime/doctor.py",
+        ".codex/runtime/tui.py",
         ".codex/test-runtime.ps1",
         ".codex/test-runtime.sh",
         ".codex/deepseek-codex.cmd",
@@ -755,15 +787,22 @@ function Stop-Proxy {
 }
 
 function Test-Proxy {
-    Invoke-RuntimeCli -RuntimeCommand "test-runtime"
+    $extraArgs = @()
+    if ($Json) { $extraArgs += "--json" }
+    Invoke-RuntimeCli -RuntimeCommand "test-runtime" -ExtraArgs $extraArgs
 }
 
 function Test-Runtime {
-    Invoke-RuntimeCli -RuntimeCommand "test-runtime"
+    $extraArgs = @()
+    if ($Json) { $extraArgs += "--json" }
+    Invoke-RuntimeCli -RuntimeCommand "test-runtime" -ExtraArgs $extraArgs
 }
 
 function Invoke-Doctor {
-    Invoke-RuntimeCli -RuntimeCommand "doctor"
+    $extraArgs = @()
+    if ($Json) { $extraArgs += "--json" }
+    if ($Deep) { $extraArgs += "--deep" }
+    Invoke-RuntimeCli -RuntimeCommand "doctor" -ExtraArgs $extraArgs
 }
 
 function Invoke-DesktopDoctor {
@@ -771,45 +810,49 @@ function Invoke-DesktopDoctor {
 }
 
 function Invoke-Delegate {
-    $extraArgs = @("--mode", $Mode, "--max-tokens", [string]$MaxTokens)
+    $extraArgs = @(
+        "--thinking-view", $ThinkingView,
+        "--patch-view", $PatchView,
+        "--ui", $Ui,
+        "--max-tokens", [string]$MaxTokens
+    )
+    if ($ThinkingModel -in @("flash", "pro")) { $extraArgs += @("--model", $ThinkingModel) }
+    if ($Thinking -in @("on", "off")) { $extraArgs += @("--thinking", $Thinking) }
+    if ($Mode) { $extraArgs += @("--mode", $Mode) }
     if ($Prompt) { $extraArgs += @("--prompt", $Prompt) }
     if ($PromptFile) { $extraArgs += @("--prompt-file", (Resolve-FullPath $PromptFile)) }
+    if ($Json) { $extraArgs += "--json" }
+    if ($Yes) { $extraArgs += "--yes" }
     if ($ThinkingView -eq "raw") { $extraArgs += "--verbose" }
     Invoke-RuntimeCli -RuntimeCommand "delegate" -ExtraArgs $extraArgs
 }
 
 function Invoke-Analyze {
-    $extraArgs = @("--mode", $Mode, "--max-tokens", [string]$MaxTokens, "--yes")
+    $extraArgs = @(
+        "--thinking-view", $ThinkingView,
+        "--patch-view", $PatchView,
+        "--ui", $Ui,
+        "--max-tokens", [string]$MaxTokens
+    )
+    if ($ThinkingModel -in @("flash", "pro")) { $extraArgs += @("--model", $ThinkingModel) }
+    if ($Thinking -in @("on", "off")) { $extraArgs += @("--thinking", $Thinking) }
+    if ($Mode) { $extraArgs += @("--mode", $Mode) }
     if ($Prompt) { $extraArgs += @("--prompt", $Prompt) }
+    if ($PromptFile) { $extraArgs += @("--prompt-file", (Resolve-FullPath $PromptFile)) }
+    if ($Json) { $extraArgs += "--json" }
+    if ($Yes) { $extraArgs += "--yes" }
+    if ($ThinkingView -eq "raw") { $extraArgs += "--verbose" }
     Invoke-RuntimeCli -RuntimeCommand "analyze" -ExtraArgs $extraArgs
 }
 
 function Show-Usage {
-    $log = Get-ProjectPath ".codex/runtime/events.log.jsonl"
-    if (-not (Test-Path -LiteralPath $log)) {
-        Write-Step "No usage log found: $log"
-        return
-    }
-    $entries = Get-Content -LiteralPath $log | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json }
-    $summary = [ordered]@{
-        requests = @($entries | Where-Object { $_.total_tokens }).Count
-        prompt_tokens = (@($entries | ForEach-Object { $_.prompt_tokens }) | Measure-Object -Sum).Sum
-        completion_tokens = (@($entries | ForEach-Object { $_.completion_tokens }) | Measure-Object -Sum).Sum
-        reasoning_tokens = (@($entries | ForEach-Object { $_.reasoning_tokens }) | Measure-Object -Sum).Sum
-        total_tokens = (@($entries | ForEach-Object { $_.total_tokens }) | Measure-Object -Sum).Sum
-        by_model_label = @($entries | Where-Object { $_.total_tokens } | Group-Object { if ($_.model_label) { $_.model_label } elseif ($_.thinking_type -eq "enabled") { "$($_.model)(thinking)" } else { $_.model } } | ForEach-Object {
-            $groupEntries = @($_.Group)
-            [pscustomobject]@{
-                model_label = $_.Name
-                requests = $groupEntries.Count
-                prompt_tokens = ($groupEntries | ForEach-Object { $_.prompt_tokens } | Measure-Object -Sum).Sum
-                completion_tokens = ($groupEntries | ForEach-Object { $_.completion_tokens } | Measure-Object -Sum).Sum
-                reasoning_tokens = ($groupEntries | ForEach-Object { $_.reasoning_tokens } | Measure-Object -Sum).Sum
-                total_tokens = ($groupEntries | ForEach-Object { $_.total_tokens } | Measure-Object -Sum).Sum
-            }
-        })
-    }
-    [pscustomobject]$summary | ConvertTo-Json -Depth 6 -Compress
+    $extraArgs = @()
+    if ($Json) { $extraArgs += "--json" }
+    Invoke-RuntimeCli -RuntimeCommand "usage" -ExtraArgs $extraArgs
+}
+
+function Show-Tui {
+    Invoke-RuntimeCli -RuntimeCommand "tui"
 }
 
 function Invoke-RedactCheck {
@@ -894,6 +937,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         "test-proxy" { Test-Proxy }
         "test-runtime" { Test-Runtime }
         "usage" { Show-Usage }
+        "tui" { Show-Tui }
         "redact" { Invoke-RedactCheck }
         "export-shareable" { Export-Shareable }
     }

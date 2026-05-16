@@ -18,6 +18,48 @@ jobs:
       - shell: pwsh
         run: ./tests/test_static_checks.ps1
 
+  windows-powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - shell: pwsh
+        run: ./tests/test_static_checks.ps1
+
+  windows-cmd-wrapper:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - shell: pwsh
+        run: |
+          $tmp = Join-Path $env:TEMP ("codex-deepseek-wrapper-" + [guid]::NewGuid().ToString())
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          try {
+            powershell -ExecutionPolicy Bypass -File .\skills\codex-deepseek-subagents\scripts\deepseek-codex.ps1 install -ProjectRoot $tmp -ApiKey sk-test-placeholder
+            & "$tmp\.codex\deepseek-codex.cmd" doctor --json
+            & "$tmp\.codex\deepseek-codex.cmd" usage --json
+          }
+          finally {
+            Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+          }
+
+  windows-runtime-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - shell: pwsh
+        run: |
+          $tmp = Join-Path $env:TEMP ("codex-deepseek-runtime-" + [guid]::NewGuid().ToString())
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          try {
+            powershell -ExecutionPolicy Bypass -File .\skills\codex-deepseek-subagents\scripts\deepseek-codex.ps1 install -ProjectRoot $tmp -ApiKey sk-test-placeholder -Port 4012
+            & "$tmp\.codex\deepseek-codex.cmd" start-runtime
+            python -c "import json,urllib.request; print(json.loads(urllib.request.urlopen('http://127.0.0.1:4012/healthz', timeout=5).read().decode())['ok'])"
+            & "$tmp\.codex\deepseek-codex.cmd" stop-runtime
+          }
+          finally {
+            Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+          }
+
   python-runtime:
     runs-on: ubuntu-latest
     steps:

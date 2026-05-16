@@ -12,6 +12,27 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
 
+RUNTIME_DIR = Path(__file__).resolve().parent
+if str(RUNTIME_DIR) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_DIR))
+
+from deepseek_client import invoke_deepseek_messages as client_invoke_deepseek_messages
+from events import (
+    append_log,
+    emit_event,
+    make_event,
+    sanitize_event_for_storage,
+    utc_now,
+    write_sse_event,
+    write_sse_headers,
+)
+from patch_preview import summarize_patch
+from tool_protocol import (
+    looks_like_failed_tool_protocol,
+    parse_tool_loop_response,
+    repair_message,
+)
+
 
 TASK_TYPES = {"analysis", "execution", "review"}
 AGENT_KINDS = {"codex_main", "deepseek_worker"}
@@ -90,10 +111,6 @@ class TaskConflictError(RuntimeError):
     pass
 
 
-def utc_now():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
 def write_json(handler, status, obj):
     data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
@@ -101,31 +118,6 @@ def write_json(handler, status, obj):
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
     handler.wfile.write(data)
-
-
-def append_log(log_path, entry):
-    path = Path(log_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"ts": utc_now(), **entry}
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
-
-
-def build_sse_payload(event):
-    return f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
-
-
-def write_sse_headers(handler):
-    handler.send_response(200)
-    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
-    handler.send_header("Cache-Control", "no-cache")
-    handler.send_header("Connection", "close")
-    handler.end_headers()
-
-
-def write_sse_event(handler, event):
-    handler.wfile.write(build_sse_payload(event))
-    handler.wfile.flush()
 
 
 def response_input_to_messages(response_input):
@@ -599,85 +591,9 @@ def usage_from_result(result):
     }
 
 
-def make_event(event_type, step=None, message="", status=None, route=None, data=None):
-    event = {
-        "event_id": f"evt_{uuid4().hex}",
-        "ts": utc_now(),
-        "type": event_type,
-    }
-    if step:
-        event["step"] = step
-    if message:
-        event["message"] = message
-    if status:
-        event["status"] = status
-    if route is not None:
-        event["route"] = route
-    if data is not None:
-        event["data"] = data
-    return event
-
-
-def emit_event(event_sink, event_type, step=None, message="", status=None, route=None, data=None):
-    event = make_event(event_type, step=step, message=message, status=status, route=route, data=data)
-    if event_sink:
-        event_sink(event)
-    return event
-
-
 def invoke_deepseek_messages(messages, mode, max_tokens, retry=None):
-    if not os.environ.get("DEEPSEEK_API_KEY"):
-        raise RuntimeError("DEEPSEEK_API_KEY is not set.")
     spec = mode_to_model_spec(mode)
-    model = spec["model"]
-    thinking = spec["thinking"]
-    model_label = f"{model}(thinking)" if thinking["type"] == "enabled" else model
-    body = {
-        "model": model,
-        "messages": messages,
-        "thinking": thinking,
-        "max_tokens": max_tokens,
-        "stream": False,
-    }
-    base_url = os.environ.get("DEEPSEEK_OPENAI_BASE_URL", "https://api.deepseek.com").rstrip("/")
-    req = urllib.request.Request(
-        f"{base_url}/chat/completions",
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"Authorization": f"Bearer {os.environ['DEEPSEEK_API_KEY']}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    retry_policy = copy.deepcopy(retry or {})
-    max_attempts = int(retry_policy.get("max_attempts") or 1)
-    backoff_seconds = float(retry_policy.get("backoff_seconds") or 0)
-    data = None
-    last_error = None
-    for attempt_index in range(max_attempts):
-        try:
-            with urllib.request.urlopen(req, timeout=300) as upstream:
-                data = json.loads(upstream.read().decode("utf-8"))
-            last_error = None
-            break
-        except Exception as exc:
-            last_error = exc
-            if attempt_index + 1 >= max_attempts:
-                break
-            time.sleep(backoff_seconds * (2 ** attempt_index))
-    if last_error is not None:
-        raise last_error
-    message = data["choices"][0]["message"]
-    usage = data.get("usage") or {}
-    details = usage.get("completion_tokens_details") or {}
-    return {
-        "content": message.get("content"),
-        "reasoning_content": message.get("reasoning_content"),
-        "model": data.get("model"),
-        "model_label": model_label,
-        "finish_reason": data["choices"][0].get("finish_reason"),
-        "prompt_tokens": usage.get("prompt_tokens"),
-        "completion_tokens": usage.get("completion_tokens"),
-        "reasoning_tokens": details.get("reasoning_tokens"),
-        "total_tokens": usage.get("total_tokens"),
-    }
+    return client_invoke_deepseek_messages(messages, spec["model"], spec["thinking"], max_tokens, retry=retry)
 
 
 def invoke_deepseek_chat(task, mode):
@@ -688,7 +604,7 @@ def invoke_deepseek_chat(task, mode):
     )
 
 
-def run_text_turn(messages, selected_mode, max_tokens, retry=None, event_sink=None):
+def run_text_turn(messages, selected_mode, max_tokens, retry=None, event_sink=None, session_id=None, task_id=None):
     initial_route = build_route(selected_mode)
     emit_event(
         event_sink,
@@ -697,14 +613,28 @@ def run_text_turn(messages, selected_mode, max_tokens, retry=None, event_sink=No
         message=f"Model: {initial_route['model_family']} | Thinking: {'ON' if initial_route['thinking_type'] == 'enabled' else 'OFF'}",
         status="routing",
         route=initial_route,
+        session_id=session_id,
+        task_id=task_id,
     )
     emit_event(
         event_sink,
-        "step.started",
+        "request.sending",
         step="reasoning",
         message="Sending request to DeepSeek.",
         status="reasoning",
         route=initial_route,
+        session_id=session_id,
+        task_id=task_id,
+    )
+    emit_event(
+        event_sink,
+        "reasoning.started",
+        step="reasoning",
+        message="Thinking active.",
+        status="reasoning",
+        route=initial_route,
+        session_id=session_id,
+        task_id=task_id,
     )
     result = invoke_deepseek_messages(messages, mode=selected_mode, max_tokens=max_tokens, retry=retry)
     route = build_route(selected_mode, result.get("model"))
@@ -718,6 +648,8 @@ def run_text_turn(messages, selected_mode, max_tokens, retry=None, event_sink=No
             status="reasoning",
             route=route,
             data={"chars": len(reasoning_content)},
+            session_id=session_id,
+            task_id=task_id,
         )
     content = str(result.get("content") or "")
     emit_event(
@@ -727,6 +659,8 @@ def run_text_turn(messages, selected_mode, max_tokens, retry=None, event_sink=No
         message=content,
         status="completed",
         route=route,
+        session_id=session_id,
+        task_id=task_id,
     )
     emit_event(
         event_sink,
@@ -736,6 +670,8 @@ def run_text_turn(messages, selected_mode, max_tokens, retry=None, event_sink=No
         status="completed",
         route=route,
         data={"usage": usage_from_result(result), "content": content},
+        session_id=session_id,
+        task_id=task_id,
     )
     return {
         "content": content,
@@ -745,8 +681,9 @@ def run_text_turn(messages, selected_mode, max_tokens, retry=None, event_sink=No
     }
 
 
-def run_native_tool_turn(state, task, allowed_tool_names, user_messages, max_output_tokens, selected_mode, event_sink=None):
+def run_native_tool_turn(state, task, allowed_tool_names, user_messages, max_output_tokens, selected_mode, event_sink=None, patch_confirm=None, session_id=None):
     route = build_route(selected_mode)
+    task_id = task["task_id"]
     emit_event(
         event_sink,
         "route.selected",
@@ -754,12 +691,14 @@ def run_native_tool_turn(state, task, allowed_tool_names, user_messages, max_out
         message=f"Model: {route['model_family']} | Thinking: {'ON' if route['thinking_type'] == 'enabled' else 'OFF'}",
         status="routing",
         route=route,
+        session_id=session_id,
+        task_id=task_id,
     )
     emit_event(
         event_sink,
-        "approval.required",
+        "approval.confirmed",
         step="approval",
-        message="Execution scope has been approved for native repository tools.",
+        message="Execution scope approved for native repository tools.",
         status="approved",
         route=route,
         data={
@@ -767,6 +706,8 @@ def run_native_tool_turn(state, task, allowed_tool_names, user_messages, max_out
             "allowed_paths": task.get("tool_policy", {}).get("allowed_paths"),
             "allowed_tools": allowed_tool_names,
         },
+        session_id=session_id,
+        task_id=task_id,
     )
     state.begin_native_tool_session(task)
     messages = build_native_tool_messages(task, user_messages, allowed_tool_names)
@@ -783,6 +724,8 @@ def run_native_tool_turn(state, task, allowed_tool_names, user_messages, max_out
                 message=f"DeepSeek reasoning turn {step + 1} started.",
                 status="reasoning",
                 route=route,
+                session_id=session_id,
+                task_id=task_id,
             )
             result = invoke_deepseek_messages(messages, mode=selected_mode, max_tokens=max_output_tokens, retry=retry_policy)
             route = build_route(selected_mode, result.get("model"))
@@ -801,9 +744,55 @@ def run_native_tool_turn(state, task, allowed_tool_names, user_messages, max_out
                     status="reasoning",
                     route=route,
                     data={"chars": len(reasoning_content), "turn": step + 1},
+                    session_id=session_id,
+                    task_id=task_id,
                 )
 
-            parsed = parse_tool_loop_response(result.get("content"))
+            raw_content = result.get("content")
+            protocol_retries = 0
+            while True:
+                try:
+                    parsed = parse_tool_loop_response(raw_content)
+                except Exception as exc:
+                    if protocol_retries >= 2:
+                        raise
+                    protocol_retries += 1
+                    emit_event(
+                        event_sink,
+                        "tool.protocol.error",
+                        step="tool_call",
+                        message="Invalid JSON tool protocol, asking model to retry structured response.",
+                        status="tool_protocol_error",
+                        route=route,
+                        data={"error": str(exc), "attempt": protocol_retries},
+                        session_id=session_id,
+                        task_id=task_id,
+                    )
+                    messages.append({"role": "assistant", "content": str(raw_content or "")})
+                    messages.append({"role": "user", "content": repair_message(str(exc))})
+                    result = invoke_deepseek_messages(messages, mode=selected_mode, max_tokens=max_output_tokens, retry=retry_policy)
+                    raw_content = result.get("content")
+                    continue
+                if parsed["type"] == "final" and looks_like_failed_tool_protocol(raw_content) and protocol_retries < 2:
+                    protocol_retries += 1
+                    emit_event(
+                        event_sink,
+                        "tool.protocol.error",
+                        step="tool_call",
+                        message="Invalid JSON tool protocol, asking model to retry structured response.",
+                        status="tool_protocol_error",
+                        route=route,
+                        data={"attempt": protocol_retries},
+                        session_id=session_id,
+                        task_id=task_id,
+                    )
+                    messages.append({"role": "assistant", "content": str(raw_content or "")})
+                    messages.append({"role": "user", "content": repair_message("Return JSON only.")})
+                    result = invoke_deepseek_messages(messages, mode=selected_mode, max_tokens=max_output_tokens, retry=retry_policy)
+                    raw_content = result.get("content")
+                    continue
+                break
+
             if parsed["type"] == "final":
                 emit_event(
                     event_sink,
@@ -812,6 +801,8 @@ def run_native_tool_turn(state, task, allowed_tool_names, user_messages, max_out
                     message=str(parsed["content"] or ""),
                     status="completed",
                     route=route,
+                    session_id=session_id,
+                    task_id=task_id,
                 )
                 state.complete_native_tool_session(task, result | {"content": parsed["content"], "route": route}, usage, tool_steps)
                 emit_event(
@@ -822,6 +813,8 @@ def run_native_tool_turn(state, task, allowed_tool_names, user_messages, max_out
                     status="completed",
                     route=route,
                     data={"usage": usage, "content": parsed["content"], "tool_steps": tool_steps},
+                    session_id=session_id,
+                    task_id=task_id,
                 )
                 return {
                     "content": str(parsed["content"] or ""),
@@ -843,8 +836,12 @@ def run_native_tool_turn(state, task, allowed_tool_names, user_messages, max_out
                 status="tool_call",
                 route=route,
                 data={"tool_name": tool_name, "target": target, "turn": step + 1},
+                session_id=session_id,
+                task_id=task_id,
             )
             if tool_name == "repo_apply_patch":
+                patch_text = parsed["arguments"].get("patch") or ""
+                summary = summarize_patch(patch_text)
                 emit_event(
                     event_sink,
                     "patch.preview",
@@ -852,9 +849,47 @@ def run_native_tool_turn(state, task, allowed_tool_names, user_messages, max_out
                     message="Patch preview generated.",
                     status="patch_ready",
                     route=route,
-                    data={"patch": parsed["arguments"].get("patch") or "", "target": target},
+                    data={"patch": patch_text, "patch_summary": summary, "target": target},
+                    session_id=session_id,
+                    task_id=task_id,
+                )
+                emit_event(
+                    event_sink,
+                    "patch.approval.required",
+                    step="patch_preview",
+                    message="Patch approval required before apply.",
+                    status="patch_waiting",
+                    route=route,
+                    data={"patch_summary": summary},
+                    session_id=session_id,
+                    task_id=task_id,
+                )
+                if patch_confirm and not patch_confirm(task, summary, patch_text):
+                    raise TaskConflictError("Patch application was not confirmed")
+                emit_event(
+                    event_sink,
+                    "patch.approval.confirmed",
+                    step="patch_preview",
+                    message="Patch approval confirmed.",
+                    status="patch_approved",
+                    route=route,
+                    data={"patch_summary": summary},
+                    session_id=session_id,
+                    task_id=task_id,
                 )
             tool_result = state.execute_native_tool(task, tool_name, parsed["arguments"])
+            if tool_name == "repo_apply_patch":
+                emit_event(
+                    event_sink,
+                    "patch.applied",
+                    step="patch_preview",
+                    message="Patch applied.",
+                    status="patch_applied",
+                    route=route,
+                    data={"patch": parsed["arguments"].get("patch") or ""},
+                    session_id=session_id,
+                    task_id=task_id,
+                )
             tool_step = {"step": step + 1, "tool_name": tool_name, "target": target}
             tool_steps.append(tool_step)
             append_log(state.log_path, {
@@ -872,6 +907,8 @@ def run_native_tool_turn(state, task, allowed_tool_names, user_messages, max_out
                 status="tool_call",
                 route=route,
                 data={"tool_name": tool_name, "target": target, "result": tool_result, "turn": step + 1},
+                session_id=session_id,
+                task_id=task_id,
             )
             messages.append({"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False)})
             messages.append({
@@ -889,48 +926,10 @@ def run_native_tool_turn(state, task, allowed_tool_names, user_messages, max_out
             status="failed",
             route=route,
             data={"error_category": classify_error(exc)},
+            session_id=session_id,
+            task_id=task_id,
         )
         raise
-
-
-def parse_jsonish_object(content):
-    text = str(content or "").strip()
-    if not text:
-        return None
-    if text.startswith("```"):
-        match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
-        if match:
-            text = match.group(1).strip()
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def parse_tool_loop_response(content):
-    parsed = parse_jsonish_object(content)
-    if not parsed:
-        return {"type": "final", "content": str(content or "").strip()}
-    response_type = str(parsed.get("type") or "").strip()
-    if response_type == "final":
-        return {"type": "final", "content": str(parsed.get("content") or "")}
-    if response_type == "tool_call":
-        tool_name = str(parsed.get("tool_name") or parsed.get("name") or "").strip()
-        arguments = parsed.get("arguments")
-        if not isinstance(arguments, dict):
-            raise ValueError("tool_call.arguments must be an object")
-        return {"type": "tool_call", "tool_name": tool_name, "arguments": arguments}
-    if parsed.get("tool_name") or parsed.get("name"):
-        arguments = parsed.get("arguments")
-        if not isinstance(arguments, dict):
-            raise ValueError("tool_call.arguments must be an object")
-        return {
-            "type": "tool_call",
-            "tool_name": str(parsed.get("tool_name") or parsed.get("name")),
-            "arguments": arguments,
-        }
-    return {"type": "final", "content": str(parsed.get("content") or str(content or "").strip())}
 
 
 def coerce_path_argument(arguments, key="path"):
@@ -938,22 +937,6 @@ def coerce_path_argument(arguments, key="path"):
     if value is None:
         raise ValueError(f"{key} is required")
     return normalize_rel_path(value)
-
-
-def sanitize_event_for_storage(event):
-    event_copy = copy.deepcopy(event)
-    if event_copy.get("type") == "reasoning.delta":
-        event_copy["message"] = "[hidden reasoning]"
-    if event_copy.get("type") == "assistant.delta":
-        event_copy["message"] = "[hidden assistant output]"
-    if event_copy.get("type") == "patch.preview":
-        event_copy.setdefault("data", {})
-        event_copy["data"]["patch"] = "[hidden patch preview]"
-    if event_copy.get("type") == "turn.completed":
-        event_copy.setdefault("data", {})
-        if "content" in event_copy["data"]:
-            event_copy["data"]["content"] = "[hidden final content]"
-    return event_copy
 
 
 class RuntimeState:
@@ -1908,6 +1891,8 @@ def build_handler(state):
                         int(payload.get("max_output_tokens") or 1024),
                         selected_mode,
                         event_sink=event_sink,
+                        patch_confirm=lambda _task, _summary, _patch_text: True,
+                        task_id=task["task_id"],
                     )
                 else:
                     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
@@ -1942,6 +1927,14 @@ def build_handler(state):
             def event_sink(event):
                 state.append_session_event(session, event)
 
+            state.append_session_event(session, make_event(
+                "session.started",
+                step="session",
+                message="Session started.",
+                status="created",
+                session_id=session["session_id"],
+            ))
+
             try:
                 if payload.get("tools"):
                     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
@@ -1958,6 +1951,8 @@ def build_handler(state):
                         int(payload.get("max_output_tokens") or 1024),
                         selected_mode,
                         event_sink=event_sink,
+                        patch_confirm=lambda _task, _summary, _patch_text: True,
+                        session_id=session["session_id"],
                     )
                 else:
                     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
@@ -1973,6 +1968,7 @@ def build_handler(state):
                         max_tokens=int(payload.get("max_output_tokens") or 512),
                         retry=state.config.get("runtime", {}).get("retry"),
                         event_sink=event_sink,
+                        session_id=session["session_id"],
                     )
                 session["status"] = "completed"
                 session["route"] = turn["route"]
@@ -1982,6 +1978,14 @@ def build_handler(state):
                     "route": turn["route"],
                 }
                 session["updated_at"] = utc_now()
+                state.append_session_event(session, make_event(
+                    "session.completed",
+                    step="session",
+                    message="Session completed.",
+                    status="completed",
+                    route=turn["route"],
+                    session_id=session["session_id"],
+                ))
                 state.save_session_store()
                 write_json(self, 201, {
                     "session_id": session["session_id"],
