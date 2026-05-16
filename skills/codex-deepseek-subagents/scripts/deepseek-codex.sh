@@ -35,9 +35,12 @@ usage() {
 Usage: deepseek-codex.sh <command> [options]
 
 Commands:
-  install, update, uninstall, doctor, desktop-doctor, delegate, analyze,
-  start-proxy, stop-proxy, test-proxy, start-runtime, stop-runtime,
+  install, update, uninstall, doctor, delegate, analyze,
+  start-runtime, stop-runtime, test-runtime,
   usage, redact, export-shareable
+
+Compatibility aliases:
+  start-proxy, stop-proxy, test-proxy, desktop-doctor
 
 Options:
   --project-root PATH
@@ -144,7 +147,7 @@ expand_scheduler_source() {
 }
 
 is_managed_file() {
-  [[ -f "$1" ]] && head -n 3 "$1" 2>/dev/null | grep -Fxq "$MANAGED_MARKER"
+  [[ -f "$1" ]] && head -n 3 "$1" 2>/dev/null | grep -Fq "Managed by codex-deepseek-subagents"
 }
 
 ensure_dir() {
@@ -196,26 +199,175 @@ write_managed_file() {
   fi
 }
 
+normalized_user_config() {
+  local existing="$1"
+  local template_file
+  template_file="$(mktemp)"
+  expand_template "user_config.json.tpl" > "$template_file"
+  local status=0
+  python3 - "$template_file" "$existing" "$SCHEDULER_ROOT/deepseek_scheduler.py" <<'PY' || status=$?
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+template_path = Path(sys.argv[1])
+existing_path = Path(sys.argv[2])
+scheduler_path = Path(sys.argv[3])
+
+template = json.loads(template_path.read_text(encoding="utf-8"))
+existing = {}
+if existing_path.exists():
+    try:
+        existing = json.loads(existing_path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        existing = {}
+
+spec = importlib.util.spec_from_file_location("deepseek_scheduler", scheduler_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+normalized = module.normalize_user_config_for_write(existing, template)
+print(json.dumps(normalized, ensure_ascii=False, indent=2))
+PY
+  rm -f "$template_file"
+  return "$status"
+}
+
+write_user_config() {
+  local path="$1"
+  [[ -e "$path" ]] && backup_file "$path"
+  ensure_dir "$(dirname "$path")"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    step "Would normalize user config: $path"
+  else
+    local content
+    content="$(normalized_user_config "$path")"
+    printf '%s\n' "$content" > "$path"
+  fi
+}
+
+initialize_runtime_state_files() {
+  local task_store session_store
+  task_store="$(project_path ".codex/runtime/task_queue.json")"
+  session_store="$(project_path ".codex/runtime/sessions.json")"
+  if [[ ! -e "$task_store" || "$FORCE" == "1" ]]; then
+    ensure_dir "$(dirname "$task_store")"
+    if [[ "$DRY_RUN" == "1" ]]; then
+      step "Would initialize runtime state file: $task_store"
+    else
+      printf '{\n  "tasks": []\n}\n' > "$task_store"
+    fi
+  fi
+  if [[ ! -e "$session_store" || "$FORCE" == "1" ]]; then
+    ensure_dir "$(dirname "$session_store")"
+    if [[ "$DRY_RUN" == "1" ]]; then
+      step "Would initialize runtime state file: $session_store"
+    else
+      printf '{\n  "sessions": []\n}\n' > "$session_store"
+    fi
+  fi
+  local rel path
+  for rel in ".codex/runtime/events.log.jsonl" ".codex/runtime/stdout.log" ".codex/runtime/stderr.log"; do
+    path="$(project_path "$rel")"
+    if [[ ! -e "$path" || "$FORCE" == "1" ]]; then
+      ensure_dir "$(dirname "$path")"
+      if [[ "$DRY_RUN" == "1" ]]; then
+        step "Would initialize runtime state file: $path"
+      else
+        : > "$path"
+      fi
+    fi
+  done
+}
+
+cleanup_legacy_artifacts() {
+  local rel path
+  for rel in \
+    ".codex/deepseek-responses-shim.ps1" \
+    ".codex/deepseek_responses_shim.py" \
+    ".codex/test-deepseek-direct.ps1" \
+    ".codex/test-deepseek-direct.sh" \
+    ".codex/test-responses-proxy.ps1" \
+    ".codex/test-responses-proxy.sh"; do
+    path="$(project_path "$rel")"
+    [[ -e "$path" ]] || continue
+    if is_managed_file "$path"; then
+      remove_managed_path "$path"
+    else
+      step "Skipping non-managed legacy file: $path"
+    fi
+  done
+  for rel in ".codex/deepseek-proxy.log.jsonl" ".codex/deepseek-proxy.pid" ".codex/deepseek-proxy.stdout.log" ".codex/deepseek-proxy.stderr.log"; do
+    path="$(project_path "$rel")"
+    [[ -e "$path" ]] || continue
+    if [[ "$DRY_RUN" == "1" ]]; then
+      step "Would remove runtime file: $path"
+    else
+      rm -f "$path"
+      step "Removed runtime file: $path"
+    fi
+  done
+}
+
 add_gitignore_rules() {
   local gitignore
   gitignore="$(project_path ".gitignore")"
-  local rules=(".codex/*.local.*" ".codex/deepseek-proxy.log.jsonl" ".codex/backups/" ".codex/deepseek-proxy.pid" ".codex/deepseek-proxy.stdout.log" ".codex/deepseek-proxy.stderr.log" ".codex/runtime/task_queue.json" "__pycache__/" "*.py[cod]")
-  local missing=()
+  local rules=(".codex/*.local.*" ".codex/runtime/task_queue.json" ".codex/runtime/sessions.json" ".codex/runtime/events.log.jsonl" ".codex/runtime/runtime.pid" ".codex/runtime/stdout.log" ".codex/runtime/stderr.log" ".codex/test-runtime.ps1" ".codex/test-runtime.sh" ".codex/backups/" "__pycache__/" "*.py[cod]")
+  local legacy_rules=(
+    ".codex/deepseek-responses-shim.ps1"
+    ".codex/deepseek_responses_shim.py"
+    ".codex/test-deepseek-direct.ps1"
+    ".codex/test-deepseek-direct.sh"
+    ".codex/test-responses-proxy.ps1"
+    ".codex/test-responses-proxy.sh"
+    ".codex/deepseek-proxy.log.jsonl"
+    ".codex/deepseek-proxy.pid"
+    ".codex/deepseek-proxy.stdout.log"
+    ".codex/deepseek-proxy.stderr.log"
+  )
+  local tmp filtered_changed=0 missing=()
+  tmp="$(mktemp)"
+  if [[ -f "$gitignore" ]]; then
+    cp "$gitignore" "$tmp"
+    for legacy in "${legacy_rules[@]}"; do
+      if grep -Fxq "$legacy" "$tmp"; then
+        filtered_changed=1
+        grep -Fvx "$legacy" "$tmp" > "$tmp.next" || true
+        mv "$tmp.next" "$tmp"
+      fi
+    done
+  fi
   for rule in "${rules[@]}"; do
-    if [[ ! -f "$gitignore" ]] || ! grep -Fxq "$rule" "$gitignore"; then
+    if [[ ! -f "$tmp" ]] || ! grep -Fxq "$rule" "$tmp"; then
       missing+=("$rule")
     fi
   done
-  [[ "${#missing[@]}" == "0" ]] && { step ".gitignore already contains DeepSeek local rules."; return; }
+  if [[ "${#missing[@]}" == "0" && "$filtered_changed" == "0" ]]; then
+    rm -f "$tmp"
+    step ".gitignore already contains current DeepSeek local rules."
+    return
+  fi
   if [[ "$DRY_RUN" == "1" ]]; then
-    step "Would append .gitignore rules: ${missing[*]}"
+    rm -f "$tmp"
+    step "Would refresh .gitignore DeepSeek local rules."
     return
   fi
   [[ -f "$gitignore" ]] && backup_file "$gitignore"
-  {
-    printf '\n# Local Codex DeepSeek secrets and logs\n'
-    printf '%s\n' "${missing[@]}"
-  } >> "$gitignore"
+  if [[ ! -f "$tmp" ]]; then
+    : > "$tmp"
+  fi
+  if [[ -s "$tmp" && "$(tail -c 1 "$tmp" 2>/dev/null || true)" != "" ]]; then
+    printf '\n' >> "$tmp"
+  fi
+  if ! grep -Fxq "# Local Codex DeepSeek secrets and logs" "$tmp"; then
+    printf '# Local Codex DeepSeek secrets and logs\n' >> "$tmp"
+  fi
+  for rule in "${rules[@]}"; do
+    if ! grep -Fxq "$rule" "$tmp"; then
+      printf '%s\n' "$rule" >> "$tmp"
+    fi
+  done
+  mv "$tmp" "$gitignore"
 }
 
 install_or_update() {
@@ -225,40 +377,31 @@ install_or_update() {
     echo "install requires --api-key. The key is written only to .codex/deepseek.local.env.*." >&2
     exit 1
   fi
+  if [[ "$is_update" == "1" ]]; then
+    sync_port_from_user_config
+  fi
   if [[ -z "$API_KEY" && "$is_update" == "1" ]]; then
     local existing
     existing="$(project_path ".codex/deepseek.local.env.sh")"
     reuse_api_key_from_managed_env "$existing" || true
     [[ -z "$API_KEY" ]] && { echo "update requires --api-key when no existing managed key can be reused. Pass --api-key explicitly." >&2; exit 1; }
   fi
-  write_managed_file "$(project_path "user_config.json")" "$(expand_template "user_config.json.tpl")"
+  write_user_config "$(project_path "user_config.json")"
   write_managed_file "$(project_path ".codex/config.toml")" "$(expand_template "config.toml.tpl")"
   write_managed_file "$(project_path ".codex/agents/deepseek-worker.toml")" "$(expand_template "deepseek-worker.toml.tpl")"
   write_managed_file "$(project_path ".codex/deepseek.local.env.sh")" "$(expand_template "deepseek.local.env.sh.tpl")" 1
   write_managed_file "$(project_path ".codex/deepseek.local.env.ps1")" "$(powershell_template_or_comment)" 1
-  write_managed_file "$(project_path ".codex/deepseek-responses-shim.ps1")" "$(powershell_shim_template_or_comment)"
-  write_managed_file "$(project_path ".codex/deepseek_responses_shim.py")" "$(expand_template "deepseek_responses_shim.py.tpl")"
   write_managed_file "$(project_path ".codex/runtime/deepseek_scheduler.py")" "$(expand_scheduler_source "deepseek_scheduler.py")"
   write_managed_file "$(project_path ".codex/runtime/deepseek_runtime.py")" "$(expand_scheduler_source "deepseek_runtime.py")"
-  write_managed_file "$(project_path ".codex/test-deepseek-direct.sh")" "$(expand_template "test-deepseek-direct.sh.tpl")"
-  write_managed_file "$(project_path ".codex/test-responses-proxy.sh")" "$(expand_template "test-responses-proxy.sh.tpl")"
-  write_managed_file "$(project_path ".codex/test-deepseek-direct.ps1")" "$(powershell_direct_test_template_or_comment)"
-  write_managed_file "$(project_path ".codex/test-responses-proxy.ps1")" "$(powershell_proxy_test_template_or_comment)"
+  write_managed_file "$(project_path ".codex/test-runtime.sh")" "$(expand_template "test-runtime.sh.tpl")"
+  write_managed_file "$(project_path ".codex/test-runtime.ps1")" "$(powershell_runtime_test_template_or_comment)"
   write_managed_file "$(project_path ".codex/deepseek-codex.cmd")" "$(powershell_expand_template "deepseek-codex.cmd.tpl")"
   write_managed_file "$(project_path ".codex/deepseek-codex.sh")" "$(expand_template "deepseek-codex.sh.tpl")"
-  local task_store
-  task_store="$(project_path ".codex/runtime/task_queue.json")"
-  if [[ ! -e "$task_store" || "$FORCE" == "1" ]]; then
-    ensure_dir "$(dirname "$task_store")"
-    if [[ "$DRY_RUN" == "1" ]]; then
-      step "Would initialize runtime task store: $task_store"
-    else
-      printf '{\n  "tasks": []\n}\n' > "$task_store"
-    fi
-  fi
+  initialize_runtime_state_files
+  cleanup_legacy_artifacts
   add_gitignore_rules
   step "$([[ "$is_update" == "1" ]] && echo Update || echo Install) complete."
-  step "Post-install check: keep only one codex-deepseek-subagents skill under CODEX_HOME/skills, then run doctor, start-runtime, and test-proxy."
+  step "Post-install check: keep only one codex-deepseek-subagents skill under CODEX_HOME/skills, then run doctor, start-runtime, and test-runtime."
 }
 
 powershell_template_or_comment() {
@@ -287,16 +430,8 @@ print(text)
 PY
 }
 
-powershell_shim_template_or_comment() {
-  powershell_expand_template "deepseek-responses-shim.ps1.tpl"
-}
-
-powershell_direct_test_template_or_comment() {
-  powershell_expand_template "test-deepseek-direct.ps1.tpl"
-}
-
-powershell_proxy_test_template_or_comment() {
-  powershell_expand_template "test-responses-proxy.ps1.tpl"
+powershell_runtime_test_template_or_comment() {
+  powershell_expand_template "test-runtime.ps1.tpl"
 }
 
 remove_managed_path() {
@@ -322,19 +457,15 @@ uninstall_project() {
     ".codex/agents/deepseek-worker.toml"
     ".codex/deepseek.local.env.sh"
     ".codex/deepseek.local.env.ps1"
-    ".codex/deepseek-responses-shim.ps1"
-    ".codex/deepseek_responses_shim.py"
     ".codex/runtime/deepseek_scheduler.py"
     ".codex/runtime/deepseek_runtime.py"
-    ".codex/test-deepseek-direct.sh"
-    ".codex/test-responses-proxy.sh"
-    ".codex/test-deepseek-direct.ps1"
-    ".codex/test-responses-proxy.ps1"
+    ".codex/test-runtime.sh"
+    ".codex/test-runtime.ps1"
     ".codex/deepseek-codex.cmd"
     ".codex/deepseek-codex.sh"
   )
   for rel in "${paths[@]}"; do remove_managed_path "$(project_path "$rel")"; done
-  for rel in ".codex/deepseek-proxy.log.jsonl" ".codex/deepseek-proxy.pid" ".codex/deepseek-proxy.stdout.log" ".codex/deepseek-proxy.stderr.log" ".codex/runtime/task_queue.json"; do
+  for rel in ".codex/deepseek-proxy.log.jsonl" ".codex/deepseek-proxy.pid" ".codex/deepseek-proxy.stdout.log" ".codex/deepseek-proxy.stderr.log" ".codex/runtime/task_queue.json" ".codex/runtime/sessions.json" ".codex/runtime/events.log.jsonl" ".codex/runtime/runtime.pid" ".codex/runtime/stdout.log" ".codex/runtime/stderr.log"; do
     local path
     path="$(project_path "$rel")"
     [[ -e "$path" ]] || continue
@@ -373,6 +504,34 @@ PY
     if [[ -n "$parsed" ]]; then
       PORT="$parsed"
     fi
+  fi
+}
+
+sync_port_from_user_config() {
+  if [[ "$PORT_EXPLICIT" == "1" ]]; then
+    return
+  fi
+  local config_path
+  config_path="$(project_path "user_config.json")"
+  [[ -f "$config_path" ]] || return
+  local parsed
+  parsed="$(
+    python3 - "$config_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+except Exception:
+    print("")
+else:
+    print((data.get("runtime") or {}).get("port") or "")
+PY
+  )"
+  if [[ -n "$parsed" ]]; then
+    PORT="$parsed"
   fi
 }
 
@@ -432,13 +591,17 @@ stop_proxy() {
 }
 
 test_proxy() {
-  runtime_cli test-proxy
+  runtime_cli test-runtime
+}
+
+test_runtime() {
+  runtime_cli test-runtime
 }
 
 show_usage() {
   require_command python3
   local log
-  log="$(project_path ".codex/deepseek-proxy.log.jsonl")"
+  log="$(project_path ".codex/runtime/events.log.jsonl")"
   [[ -f "$log" ]] || { step "No usage log found: $log"; return; }
   python3 - "$log" <<'PY'
 import json, sys
@@ -469,7 +632,7 @@ PY
 }
 
 redact_check() {
-  if grep -RInE 'sk-[A-Za-z0-9]{12,}' "$PROJECT_ROOT" --exclude='*.local.*' --exclude='deepseek-proxy.log.jsonl' --exclude-dir='.git' --exclude-dir='backups' >/tmp/codex-deepseek-redact.txt; then
+  if grep -RInE 'sk-[A-Za-z0-9]{12,}' "$PROJECT_ROOT" --exclude='*.local.*' --exclude='events.log.jsonl' --exclude-dir='.git' --exclude-dir='backups' >/tmp/codex-deepseek-redact.txt; then
     cat /tmp/codex-deepseek-redact.txt
   else
     step "No non-local DeepSeek-looking keys found."
@@ -481,7 +644,7 @@ export_shareable() {
   local destination="${OUT_FILE:-$PROJECT_ROOT/codex-deepseek-subagents.zip}"
   if [[ "$DRY_RUN" == "1" ]]; then step "Would export shareable skill zip to $destination"; return; fi
   rm -f "$destination"
-  (cd "$SKILL_ROOT" && zip -qr "$destination" SKILL.md agents scripts templates scheduler -x '*.local.env.sh' '*.local.env.ps1' '*/deepseek-proxy.log.jsonl' '*/backups/*')
+  (cd "$SKILL_ROOT" && zip -qr "$destination" SKILL.md agents scripts templates scheduler -x '*.local.env.sh' '*.local.env.ps1' '*/events.log.jsonl' '*/backups/*' '*/__pycache__/*' '*.pyc')
   step "Exported shareable skill zip: $destination"
 }
 
@@ -498,6 +661,7 @@ case "$COMMAND" in
   stop-proxy) stop_proxy ;;
   stop-runtime) stop_proxy ;;
   test-proxy) test_proxy ;;
+  test-runtime) test_runtime ;;
   usage) show_usage ;;
   redact) redact_check ;;
   export-shareable) export_shareable ;;

@@ -71,7 +71,19 @@ def detect_install_state(project_root):
         "runtime": project_path(project_root, ".codex/runtime/deepseek_scheduler.py"),
     }
     existing = {name: path.exists() for name, path in required.items()}
-    legacy = project_path(project_root, ".codex/deepseek_responses_shim.py").exists()
+    legacy_paths = [
+        ".codex/deepseek-responses-shim.ps1",
+        ".codex/deepseek_responses_shim.py",
+        ".codex/test-deepseek-direct.ps1",
+        ".codex/test-deepseek-direct.sh",
+        ".codex/test-responses-proxy.ps1",
+        ".codex/test-responses-proxy.sh",
+        ".codex/deepseek-proxy.log.jsonl",
+        ".codex/deepseek-proxy.pid",
+        ".codex/deepseek-proxy.stdout.log",
+        ".codex/deepseek-proxy.stderr.log",
+    ]
+    legacy = [relative for relative in legacy_paths if project_path(project_root, relative).exists()]
     if not any(existing.values()) and not legacy:
         return "not_installed", existing, legacy
     if all(existing.values()):
@@ -94,13 +106,13 @@ def process_alive(pid):
 
 
 def pid_file(project_root):
-    return project_path(project_root, ".codex/deepseek-proxy.pid")
+    return project_path(project_root, ".codex/runtime/runtime.pid")
 
 
 def wait_for_log_release(project_root, timeout_seconds=6):
     targets = [
-        project_path(project_root, ".codex/deepseek-proxy.stdout.log"),
-        project_path(project_root, ".codex/deepseek-proxy.stderr.log"),
+        project_path(project_root, ".codex/runtime/stdout.log"),
+        project_path(project_root, ".codex/runtime/stderr.log"),
     ]
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
@@ -158,7 +170,8 @@ def load_state(project_root, port_override=None):
     load_project_env(project_root)
     config_path = project_path(project_root, "user_config.json")
     task_store = project_path(project_root, ".codex/runtime/task_queue.json")
-    log_path = project_path(project_root, ".codex/deepseek-proxy.log.jsonl")
+    session_store = project_path(project_root, ".codex/runtime/sessions.json")
+    log_path = project_path(project_root, ".codex/runtime/events.log.jsonl")
     config = scheduler.validate_user_config(json.loads(config_path.read_text(encoding="utf-8-sig")))
     port = port_override or int(config["runtime"]["port"])
     state = scheduler.RuntimeState(
@@ -167,11 +180,12 @@ def load_state(project_root, port_override=None):
         port=port,
         user_config_path=config_path,
         task_store_path=task_store,
+        session_store_path=session_store,
     )
     return state
 
 
-def proxy_base_url(project_root, port_override=None):
+def runtime_base_url(project_root, port_override=None):
     env = load_project_env(project_root)
     if port_override:
         return f"http://127.0.0.1:{port_override}/v1"
@@ -266,7 +280,7 @@ def command_doctor(args):
         "worker_exists": existing["worker"],
         "env_exists": existing["env"],
         "runtime_entry_exists": existing["runtime"],
-        "legacy_shim_exists": legacy,
+        "stale_legacy_artifacts": legacy,
     }
     if existing["user_config"]:
         try:
@@ -278,17 +292,19 @@ def command_doctor(args):
                 if agent.get("enabled", True)
             ]
             report["collaboration_capabilities"] = scheduler.runtime_capabilities()
+            report["runtime_ready"] = True
             report["route_display_ready"] = True
             report["interactive_cli_ready"] = True
             report["reasoning_stream_ready"] = True
+            report["native_tool_agent_ready"] = True
         except Exception as exc:
             report["user_config_valid"] = False
             report["user_config_error"] = str(exc)
     pid = read_pid(project_root)
-    report["proxy_pid_exists"] = pid is not None
-    report["proxy_process_alive"] = process_alive(pid)
+    report["runtime_pid_exists"] = pid is not None
+    report["runtime_process_alive"] = process_alive(pid)
     try:
-        base_url = proxy_base_url(project_root, args.port)
+        base_url = runtime_base_url(project_root, args.port)
         with urllib.request.urlopen(base_url.rstrip("/v1") + "/healthz", timeout=2) as res:
             report["runtime_health"] = json.loads(res.read().decode("utf-8"))
     except Exception as exc:
@@ -303,7 +319,7 @@ def command_start_runtime(args):
     runtime_file = project_path(project_root, ".codex/runtime/deepseek_scheduler.py")
     if not runtime_file.exists():
         raise RuntimeError(f"Runtime entrypoint is missing: {runtime_file}")
-    base_url = proxy_base_url(project_root, args.port).rstrip("/v1")
+    base_url = runtime_base_url(project_root, args.port).rstrip("/v1")
     existing_pid = read_pid(project_root)
     if process_alive(existing_pid):
         try:
@@ -338,17 +354,19 @@ def command_start_runtime(args):
             "--port",
             str(port),
             "--log-path",
-            ".codex/deepseek-proxy.log.jsonl",
+            ".codex/runtime/events.log.jsonl",
             "--stdout-log",
-            ".codex/deepseek-proxy.stdout.log",
+            ".codex/runtime/stdout.log",
             "--stderr-log",
-            ".codex/deepseek-proxy.stderr.log",
+            ".codex/runtime/stderr.log",
             "--project-root",
             ".",
             "--user-config",
             "user_config.json",
             "--task-store",
             ".codex/runtime/task_queue.json",
+            "--session-store",
+            ".codex/runtime/sessions.json",
         ],
         **kwargs,
     )
@@ -385,8 +403,8 @@ def command_stop_runtime(args):
         pass
 
 
-def proxy_request(project_root, body):
-    base = proxy_base_url(project_root)
+def runtime_request(project_root, body):
+    base = runtime_base_url(project_root)
     req = urllib.request.Request(
         base.rstrip("/") + "/responses",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -400,24 +418,37 @@ def proxy_request(project_root, body):
         return json.loads(res.read().decode("utf-8"))
 
 
-def command_test_proxy(args):
+def command_test_runtime(args):
     project_root = Path(args.project_root).resolve()
     load_project_env(project_root)
-    response = proxy_request(project_root, {
+    response = runtime_request(project_root, {
         "model": os.environ.get("DEEPSEEK_OPENAI_MODEL"),
-        "input": [{"role": "user", "content": 'Return exactly this JSON and nothing else: {"status":"proxy-ok"}'}],
+        "input": [{"role": "user", "content": 'Return exactly this JSON and nothing else: {"status":"runtime-ok"}'}],
         "metadata": {"deepseek_reasoning_effort": "disabled"},
         "max_output_tokens": 64,
     })
     if args.json:
-        print_json(response)
+        usage = response.get("usage") or {}
+        print_json({
+            "id": response.get("id"),
+            "status": response.get("status"),
+            "model": response.get("model"),
+            "model_label": response.get("model_label"),
+            "route": response.get("route"),
+            "output_text": response.get("output_text"),
+            "contains_runtime_ok": "runtime-ok" in str(response.get("output_text")),
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "reasoning_tokens": usage.get("reasoning_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+        })
         return
     route = response.get("route") or {
         "model_family": "flash" if "flash" in str(response.get("model_label") or "").lower() else "pro",
         "thinking_type": "enabled" if "thinking" in str(response.get("model_label") or "") else "disabled",
         "display_label": response.get("model_label") or response.get("model"),
     }
-    for line in render_status_card(route, "text_delegate", response.get("status")):
+    for line in render_status_card(route, "test-runtime", response.get("status")):
         print(line)
     print(f"[DeepSeek] Output: {response.get('output_text')}")
 
@@ -527,7 +558,7 @@ def command_analyze(args):
 
 def build_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["doctor", "start-runtime", "stop-runtime", "test-proxy", "delegate", "analyze"])
+    parser.add_argument("command", choices=["doctor", "start-runtime", "stop-runtime", "test-runtime", "test-proxy", "delegate", "analyze"])
     parser.add_argument("--project-root", default=".")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--prompt", default="")
@@ -555,8 +586,8 @@ def main():
         return command_start_runtime(args)
     if args.command == "stop-runtime":
         return command_stop_runtime(args)
-    if args.command == "test-proxy":
-        return command_test_proxy(args)
+    if args.command in {"test-runtime", "test-proxy"}:
+        return command_test_runtime(args)
     if args.command == "delegate":
         return command_delegate(args)
     if args.command == "analyze":

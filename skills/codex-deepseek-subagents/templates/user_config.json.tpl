@@ -34,7 +34,10 @@
       "endpoint": "local/deepseek-worker",
       "enabled": true,
       "capabilities": [
-        "execution"
+        "execution",
+        "native_tools",
+        "repo_patch",
+        "repo_search"
       ],
       "defaults": {
         "mode": "pro-thinking"

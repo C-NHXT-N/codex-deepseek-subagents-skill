@@ -16,6 +16,7 @@ from uuid import uuid4
 TASK_TYPES = {"analysis", "execution", "review"}
 AGENT_KINDS = {"codex_main", "deepseek_worker"}
 DEFAULT_TASK_STORE = {"tasks": []}
+DEFAULT_SESSION_STORE = {"sessions": []}
 SUPPORTED_NATIVE_TOOLS = (
     "repo_list_files",
     "repo_read_file",
@@ -391,6 +392,59 @@ def validate_user_config(config):
     return normalized
 
 
+def normalize_user_config_for_write(existing_config, template_config):
+    template = copy.deepcopy(template_config if isinstance(template_config, dict) else {})
+    existing = copy.deepcopy(existing_config if isinstance(existing_config, dict) else {})
+
+    merged = {
+        "runtime": copy.deepcopy(template.get("runtime") or {}),
+        "ui": copy.deepcopy(template.get("ui") or {}),
+        "connected_agents": copy.deepcopy(template.get("connected_agents") or []),
+        "defaults": copy.deepcopy(template.get("defaults") or {}),
+    }
+
+    runtime = existing.get("runtime")
+    if isinstance(runtime, dict):
+        merged["runtime"].update(runtime)
+        existing_retry = runtime.get("retry")
+        if isinstance(existing_retry, dict):
+            merged["runtime"].setdefault("retry", {})
+            merged["runtime"]["retry"].update(existing_retry)
+
+    ui = existing.get("ui")
+    if isinstance(ui, dict):
+        merged["ui"].update(ui)
+
+    connected_agents = existing.get("connected_agents")
+    if isinstance(connected_agents, list) and connected_agents:
+        merged["connected_agents"] = connected_agents
+
+    defaults = existing.get("defaults")
+    if isinstance(defaults, dict):
+        for key in ("execution_agent", "review_agent", "verbose"):
+            if key in defaults:
+                merged["defaults"][key] = defaults[key]
+        merged["defaults"].setdefault("tool_policy", {})
+        existing_policy = defaults.get("tool_policy")
+        if isinstance(existing_policy, dict):
+            merged["defaults"]["tool_policy"].update(existing_policy)
+        for legacy_key, policy_key in (
+            ("allowed_paths", "allowed_paths"),
+            ("read_extensions", "read_extensions"),
+            ("write_extensions", "write_extensions"),
+            ("default_allowed_tools", "allowed_tools"),
+            ("max_file_read_bytes", "max_file_read_bytes"),
+            ("max_search_results", "max_search_results"),
+            ("max_tool_steps", "max_tool_steps"),
+            ("allow_full_rewrite", "allow_full_rewrite"),
+            ("allow_delete", "allow_delete"),
+        ):
+            if legacy_key in defaults:
+                merged["defaults"]["tool_policy"][policy_key] = defaults[legacy_key]
+
+    return validate_user_config(merged)
+
+
 def build_agent_index(config):
     index = {}
     for agent in config["connected_agents"]:
@@ -414,6 +468,7 @@ def initial_status_for_agent(agent):
 
 def runtime_capabilities():
     return {
+        "runtime_ready": True,
         "text_delegate_ready": True,
         "native_tool_agent_ready": True,
         "responses_smoke_test": True,
@@ -885,17 +940,34 @@ def coerce_path_argument(arguments, key="path"):
     return normalize_rel_path(value)
 
 
+def sanitize_event_for_storage(event):
+    event_copy = copy.deepcopy(event)
+    if event_copy.get("type") == "reasoning.delta":
+        event_copy["message"] = "[hidden reasoning]"
+    if event_copy.get("type") == "assistant.delta":
+        event_copy["message"] = "[hidden assistant output]"
+    if event_copy.get("type") == "patch.preview":
+        event_copy.setdefault("data", {})
+        event_copy["data"]["patch"] = "[hidden patch preview]"
+    if event_copy.get("type") == "turn.completed":
+        event_copy.setdefault("data", {})
+        if "content" in event_copy["data"]:
+            event_copy["data"]["content"] = "[hidden final content]"
+    return event_copy
+
+
 class RuntimeState:
-    def __init__(self, project_root, log_path, port, user_config_path, task_store_path):
+    def __init__(self, project_root, log_path, port, user_config_path, task_store_path, session_store_path):
         self.project_root = Path(project_root).resolve()
         self.log_path = str(Path(log_path))
         self.port = port
         self.user_config_path = Path(user_config_path)
         self.task_store_path = Path(task_store_path)
+        self.session_store_path = Path(session_store_path)
         self.config = self.load_user_config()
         self.agent_index = build_agent_index(self.config)
         self.task_store = self.load_task_store()
-        self.sessions = {}
+        self.sessions = self.load_session_store()
 
     def load_user_config(self):
         if not self.user_config_path.exists():
@@ -919,6 +991,32 @@ class RuntimeState:
         self.task_store_path.parent.mkdir(parents=True, exist_ok=True)
         self.task_store_path.write_text(json.dumps(self.task_store, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    def load_session_store(self):
+        if not self.session_store_path.exists():
+            self.session_store_path.parent.mkdir(parents=True, exist_ok=True)
+            self.session_store_path.write_text(json.dumps(DEFAULT_SESSION_STORE, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            return {}
+        with self.session_store_path.open("r", encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
+            raise RuntimeError(f"Invalid session store format: {self.session_store_path}")
+        return {session["session_id"]: session for session in data["sessions"] if isinstance(session, dict) and session.get("session_id")}
+
+    def save_session_store(self):
+        self.session_store_path.parent.mkdir(parents=True, exist_ok=True)
+        sessions = []
+        for session in self.sessions.values():
+            sanitized = copy.deepcopy(session)
+            sanitized["events"] = [sanitize_event_for_storage(event) for event in sanitized.get("events", [])]
+            if isinstance(sanitized.get("response"), dict):
+                sanitized["response"] = {
+                    "route": copy.deepcopy(sanitized["response"].get("route")),
+                    "usage": copy.deepcopy(sanitized["response"].get("usage")),
+                }
+            sessions.append(sanitized)
+        payload = {"sessions": sessions}
+        self.session_store_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
     def find_task(self, task_id):
         for task in self.task_store["tasks"]:
             if task["task_id"] == task_id:
@@ -933,8 +1031,10 @@ class RuntimeState:
             "project_root": str(self.project_root),
             "user_config_path": str(self.user_config_path),
             "task_store_path": str(self.task_store_path),
+            "session_store_path": str(self.session_store_path),
             "agents": len([agent for agent in self.config["connected_agents"] if agent.get("enabled", True)]),
             "tasks": len(self.task_store["tasks"]),
+            "sessions": len(self.sessions),
             "capabilities": runtime_capabilities(),
         }
 
@@ -954,6 +1054,7 @@ class RuntimeState:
             "response": None,
         }
         self.sessions[session_id] = session
+        self.save_session_store()
         return session
 
     def get_session(self, session_id):
@@ -964,6 +1065,12 @@ class RuntimeState:
         if event.get("route"):
             session["route"] = event["route"]
         session["updated_at"] = utc_now()
+        append_log(self.log_path, {
+            "kind": "session_event",
+            "session_id": session["session_id"],
+            "event": sanitize_event_for_storage(event),
+        })
+        self.save_session_store()
 
     def create_task(self, payload):
         task_type = str(payload.get("type") or "").strip()
@@ -1875,6 +1982,7 @@ def build_handler(state):
                     "route": turn["route"],
                 }
                 session["updated_at"] = utc_now()
+                state.save_session_store()
                 write_json(self, 201, {
                     "session_id": session["session_id"],
                     "status": session["status"],
@@ -1892,6 +2000,7 @@ def build_handler(state):
                     status="failed",
                     data={"error_category": classify_error(exc)},
                 ))
+                state.save_session_store()
                 raise
 
     return Handler
@@ -1900,12 +2009,13 @@ def build_handler(state):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--log-path", default=".codex/deepseek-proxy.log.jsonl")
+    parser.add_argument("--log-path", default=".codex/runtime/events.log.jsonl")
     parser.add_argument("--stdout-log", default="")
     parser.add_argument("--stderr-log", default="")
     parser.add_argument("--project-root", default=".")
     parser.add_argument("--user-config", default="user_config.json")
     parser.add_argument("--task-store", default=".codex/runtime/task_queue.json")
+    parser.add_argument("--session-store", default=".codex/runtime/sessions.json")
     args = parser.parse_args()
 
     project_root = Path(args.project_root).resolve()
@@ -1924,6 +2034,7 @@ def main():
         port=args.port,
         user_config_path=(project_root / args.user_config),
         task_store_path=(project_root / args.task_store),
+        session_store_path=(project_root / args.session_store),
     )
     server = ThreadingHTTPServer(("127.0.0.1", args.port), build_handler(state))
     print(f"DeepSeek scheduler listening on http://127.0.0.1:{args.port}/")

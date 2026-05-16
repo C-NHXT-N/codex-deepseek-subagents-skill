@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("install", "update", "uninstall", "doctor", "desktop-doctor", "delegate", "analyze", "start-proxy", "stop-proxy", "test-proxy", "start-runtime", "stop-runtime", "usage", "redact", "export-shareable")]
+    [ValidateSet("install", "update", "uninstall", "doctor", "desktop-doctor", "delegate", "analyze", "start-proxy", "stop-proxy", "test-proxy", "test-runtime", "start-runtime", "stop-runtime", "usage", "redact", "export-shareable")]
     [string]$Command = "doctor",
 
     [string]$ProjectRoot = (Get-Location).Path,
@@ -109,7 +109,7 @@ function Test-ManagedFile {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
     $header = Get-Content -LiteralPath $Path -TotalCount 3 -ErrorAction SilentlyContinue
-    return @($header) -contains $ManagedMarker
+    return [bool](@($header | ForEach-Object { [string]$_ }) -match [regex]::Escape("Managed by codex-deepseek-subagents"))
 }
 
 function Ensure-Directory {
@@ -121,6 +121,24 @@ function Ensure-Directory {
     if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Path $Path | Out-Null
     }
+}
+
+function Write-TextFile {
+    param(
+        [string]$Path,
+        [AllowNull()]$Content
+    )
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    $text = if ($Content -is [string]) {
+        $Content
+    }
+    elseif ($Content -is [System.Array]) {
+        (($Content | ForEach-Object { [string]$_ }) -join [Environment]::NewLine) + [Environment]::NewLine
+    }
+    else {
+        [string]$Content
+    }
+    [System.IO.File]::WriteAllText($Path, $text, $encoding)
 }
 
 function Backup-File {
@@ -155,7 +173,7 @@ function Write-ManagedFile {
         Write-Step "Would write ${kind}: $Path"
         return
     }
-    Set-Content -LiteralPath $Path -Value $Content -Encoding UTF8
+    Write-TextFile -Path $Path -Content $Content
     if ($Path -match '\.(sh|py)$') {
         try {
             if (-not $IsWindows) { chmod +x $Path }
@@ -164,38 +182,184 @@ function Write-ManagedFile {
     }
 }
 
+function Get-NormalizedUserConfigContent {
+    param([string]$ExistingPath)
+    $python = Get-PythonCommand
+    $schedulerPath = Join-Path $SchedulerRoot "deepseek_scheduler.py"
+    $templatePath = [System.IO.Path]::GetTempFileName()
+    $pythonScript = @'
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+template_path = Path(sys.argv[1])
+existing_path = Path(sys.argv[2])
+scheduler_path = Path(sys.argv[3])
+
+template = json.loads(template_path.read_text(encoding="utf-8-sig"))
+existing = {}
+if existing_path.exists():
+    try:
+        existing = json.loads(existing_path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        existing = {}
+
+spec = importlib.util.spec_from_file_location("deepseek_scheduler", scheduler_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+normalized = module.normalize_user_config_for_write(existing, template)
+sys.stdout.write(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n")
+'@
+    try {
+        Set-Content -LiteralPath $templatePath -Value (Expand-Template "user_config.json.tpl") -Encoding UTF8
+        return ($pythonScript | & $python - $templatePath $ExistingPath $schedulerPath)
+    }
+    finally {
+        Remove-Item -LiteralPath $templatePath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Write-UserConfig {
+    param([string]$Path)
+    if (Test-Path -LiteralPath $Path) {
+        Backup-File $Path
+    }
+    Ensure-Directory (Split-Path -Parent $Path)
+    if ($DryRun) {
+        Write-Step "Would normalize user config: $Path"
+        return
+    }
+    $content = Get-NormalizedUserConfigContent -ExistingPath $Path
+    Write-TextFile -Path $Path -Content $content
+}
+
+function Initialize-RuntimeStateFiles {
+    $jsonFiles = @(
+        @{ Path = ".codex/runtime/task_queue.json"; Content = (@{ tasks = @() } | ConvertTo-Json -Depth 4) },
+        @{ Path = ".codex/runtime/sessions.json"; Content = (@{ sessions = @() } | ConvertTo-Json -Depth 4) }
+    )
+    foreach ($entry in $jsonFiles) {
+        $path = Get-ProjectPath $entry.Path
+        if ((-not (Test-Path -LiteralPath $path)) -or $Force) {
+            Ensure-Directory (Split-Path -Parent $path)
+            if ($DryRun) {
+                Write-Step "Would initialize runtime state file: $path"
+            }
+            else {
+                Write-TextFile -Path $path -Content $entry.Content
+            }
+        }
+    }
+    foreach ($relative in @(
+        ".codex/runtime/events.log.jsonl",
+        ".codex/runtime/stdout.log",
+        ".codex/runtime/stderr.log"
+    )) {
+        $path = Get-ProjectPath $relative
+        if ((-not (Test-Path -LiteralPath $path)) -or $Force) {
+            Ensure-Directory (Split-Path -Parent $path)
+            if ($DryRun) {
+                Write-Step "Would initialize runtime state file: $path"
+            }
+            else {
+                Write-TextFile -Path $path -Content ""
+            }
+        }
+    }
+}
+
+function Remove-LegacyArtifacts {
+    foreach ($relative in @(
+        ".codex/deepseek-responses-shim.ps1",
+        ".codex/deepseek_responses_shim.py",
+        ".codex/test-deepseek-direct.ps1",
+        ".codex/test-deepseek-direct.sh",
+        ".codex/test-responses-proxy.ps1",
+        ".codex/test-responses-proxy.sh"
+    )) {
+        $path = Get-ProjectPath $relative
+        if (Test-Path -LiteralPath $path) {
+            if (Test-ManagedFile $path) {
+                Remove-ManagedPath $path
+            }
+            else {
+                Write-Step "Skipping non-managed legacy file: $path"
+            }
+        }
+    }
+    foreach ($relative in @(
+        ".codex/deepseek-proxy.log.jsonl",
+        ".codex/deepseek-proxy.pid",
+        ".codex/deepseek-proxy.stdout.log",
+        ".codex/deepseek-proxy.stderr.log"
+    )) {
+        Remove-RuntimePath (Get-ProjectPath $relative)
+    }
+}
+
 function Add-GitIgnoreRules {
     $gitignore = Get-ProjectPath ".gitignore"
     $rules = @(
         ".codex/*.local.*",
-        ".codex/deepseek-proxy.log.jsonl",
-        ".codex/deepseek-proxy.pid",
-        ".codex/deepseek-proxy.stdout.log",
-        ".codex/deepseek-proxy.stderr.log",
         ".codex/runtime/task_queue.json",
+        ".codex/runtime/sessions.json",
+        ".codex/runtime/events.log.jsonl",
+        ".codex/runtime/runtime.pid",
+        ".codex/runtime/stdout.log",
+        ".codex/runtime/stderr.log",
+        ".codex/test-runtime.ps1",
+        ".codex/test-runtime.sh",
         ".codex/backups/",
         "__pycache__/",
         "*.py[cod]"
     )
+    $legacyRules = @(
+        ".codex/deepseek-responses-shim.ps1",
+        ".codex/deepseek_responses_shim.py",
+        ".codex/test-deepseek-direct.ps1",
+        ".codex/test-deepseek-direct.sh",
+        ".codex/test-responses-proxy.ps1",
+        ".codex/test-responses-proxy.sh",
+        ".codex/deepseek-proxy.log.jsonl",
+        ".codex/deepseek-proxy.pid",
+        ".codex/deepseek-proxy.stdout.log",
+        ".codex/deepseek-proxy.stderr.log"
+    )
     $existing = if (Test-Path -LiteralPath $gitignore) { Get-Content -LiteralPath $gitignore } else { @() }
-    $missing = @($rules | Where-Object { $existing -notcontains $_ })
-    if ($missing.Count -eq 0) {
-        Write-Step ".gitignore already contains DeepSeek local rules."
+    $filtered = @($existing | Where-Object { $legacyRules -notcontains $_ })
+    $missing = @($rules | Where-Object { $filtered -notcontains $_ })
+    if (($missing.Count -eq 0) -and ($filtered.Count -eq $existing.Count)) {
+        Write-Step ".gitignore already contains current DeepSeek local rules."
         return
     }
     if ($DryRun) {
-        Write-Step "Would append .gitignore rules: $($missing -join ', ')"
+        Write-Step "Would refresh .gitignore DeepSeek local rules."
         return
     }
     if (Test-Path -LiteralPath $gitignore) { Backup-File $gitignore }
-    Add-Content -LiteralPath $gitignore -Value @("", "# Local Codex DeepSeek secrets and logs") -Encoding UTF8
-    Add-Content -LiteralPath $gitignore -Value $missing -Encoding UTF8
+    $output = @($filtered)
+    if ($output.Count -gt 0 -and $output[-1] -ne "") {
+        $output += ""
+    }
+    if ($output -notcontains "# Local Codex DeepSeek secrets and logs") {
+        $output += "# Local Codex DeepSeek secrets and logs"
+    }
+    foreach ($rule in $rules) {
+        if ($output -notcontains $rule) {
+            $output += $rule
+        }
+    }
+    Write-TextFile -Path $gitignore -Content $output
 }
 
 function Install-OrUpdate {
     param([bool]$IsUpdate)
     if (-not $ApiKey -and -not $IsUpdate) {
         throw "install requires -ApiKey. The key is written only to .codex/deepseek.local.env.ps1."
+    }
+    if ($IsUpdate) {
+        Sync-PortFromUserConfig
     }
     if (-not $ApiKey -and $IsUpdate) {
         $existingEnv = Get-ProjectPath ".codex/deepseek.local.env.ps1"
@@ -211,32 +375,20 @@ function Install-OrUpdate {
 
     Write-ManagedFile (Get-ProjectPath ".codex/config.toml") (Expand-Template "config.toml.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/agents/deepseek-worker.toml") (Expand-Template "deepseek-worker.toml.tpl")
-    Write-ManagedFile (Get-ProjectPath "user_config.json") (Expand-Template "user_config.json.tpl")
+    Write-UserConfig (Get-ProjectPath "user_config.json")
     Write-ManagedFile (Get-ProjectPath ".codex/deepseek.local.env.ps1") (Expand-Template "deepseek.local.env.ps1.tpl") -Secret
     Write-ManagedFile (Get-ProjectPath ".codex/deepseek.local.env.sh") (Expand-Template "deepseek.local.env.sh.tpl") -Secret
-    Write-ManagedFile (Get-ProjectPath ".codex/deepseek-responses-shim.ps1") (Expand-Template "deepseek-responses-shim.ps1.tpl")
-    Write-ManagedFile (Get-ProjectPath ".codex/deepseek_responses_shim.py") (Expand-Template "deepseek_responses_shim.py.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/runtime/deepseek_scheduler.py") (Expand-SchedulerSource "deepseek_scheduler.py")
     Write-ManagedFile (Get-ProjectPath ".codex/runtime/deepseek_runtime.py") (Expand-SchedulerSource "deepseek_runtime.py")
-    Write-ManagedFile (Get-ProjectPath ".codex/test-deepseek-direct.ps1") (Expand-Template "test-deepseek-direct.ps1.tpl")
-    Write-ManagedFile (Get-ProjectPath ".codex/test-deepseek-direct.sh") (Expand-Template "test-deepseek-direct.sh.tpl")
-    Write-ManagedFile (Get-ProjectPath ".codex/test-responses-proxy.ps1") (Expand-Template "test-responses-proxy.ps1.tpl")
-    Write-ManagedFile (Get-ProjectPath ".codex/test-responses-proxy.sh") (Expand-Template "test-responses-proxy.sh.tpl")
+    Write-ManagedFile (Get-ProjectPath ".codex/test-runtime.ps1") (Expand-Template "test-runtime.ps1.tpl")
+    Write-ManagedFile (Get-ProjectPath ".codex/test-runtime.sh") (Expand-Template "test-runtime.sh.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/deepseek-codex.cmd") (Expand-Template "deepseek-codex.cmd.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/deepseek-codex.sh") (Expand-Template "deepseek-codex.sh.tpl")
-    $taskStorePath = Get-ProjectPath ".codex/runtime/task_queue.json"
-    if ((-not (Test-Path -LiteralPath $taskStorePath)) -or $Force) {
-        Ensure-Directory (Split-Path -Parent $taskStorePath)
-        if ($DryRun) {
-            Write-Step "Would initialize runtime task store: $taskStorePath"
-        }
-        else {
-            Set-Content -LiteralPath $taskStorePath -Value (@{ tasks = @() } | ConvertTo-Json -Depth 4) -Encoding UTF8
-        }
-    }
+    Initialize-RuntimeStateFiles
+    Remove-LegacyArtifacts
     Add-GitIgnoreRules
     Write-Step "$(if ($IsUpdate) { 'Update' } else { 'Install' }) complete."
-    Write-Step "Post-install check: keep only one codex-deepseek-subagents skill under CODEX_HOME/skills, then run doctor, start-runtime, and test-proxy."
+    Write-Step "Post-install check: keep only one codex-deepseek-subagents skill under CODEX_HOME/skills, then run doctor, start-runtime, and test-runtime."
 }
 
 function Remove-ManagedPath {
@@ -256,7 +408,7 @@ function Remove-ManagedPath {
 }
 
 function Stop-ProxyForUninstall {
-    $pidFile = Get-ProjectPath ".codex/deepseek-proxy.pid"
+    $pidFile = Get-ProjectPath ".codex/runtime/runtime.pid"
     if (-not (Test-Path -LiteralPath $pidFile)) { return }
     try {
         $pidText = (Get-Content -Raw -LiteralPath $pidFile).Trim()
@@ -293,14 +445,10 @@ function Uninstall-Project {
         ".codex/agents/deepseek-worker.toml",
         ".codex/deepseek.local.env.ps1",
         ".codex/deepseek.local.env.sh",
-        ".codex/deepseek-responses-shim.ps1",
-        ".codex/deepseek_responses_shim.py",
         ".codex/runtime/deepseek_scheduler.py",
         ".codex/runtime/deepseek_runtime.py",
-        ".codex/test-deepseek-direct.ps1",
-        ".codex/test-deepseek-direct.sh",
-        ".codex/test-responses-proxy.ps1",
-        ".codex/test-responses-proxy.sh",
+        ".codex/test-runtime.ps1",
+        ".codex/test-runtime.sh",
         ".codex/deepseek-codex.cmd",
         ".codex/deepseek-codex.sh"
     )
@@ -313,7 +461,12 @@ function Uninstall-Project {
         ".codex/deepseek-proxy.pid",
         ".codex/deepseek-proxy.stdout.log",
         ".codex/deepseek-proxy.stderr.log",
-        ".codex/runtime/task_queue.json"
+        ".codex/runtime/task_queue.json",
+        ".codex/runtime/sessions.json",
+        ".codex/runtime/events.log.jsonl",
+        ".codex/runtime/runtime.pid",
+        ".codex/runtime/stdout.log",
+        ".codex/runtime/stderr.log"
     )
     foreach ($relative in $runtimePaths) {
         Remove-RuntimePath (Get-ProjectPath $relative)
@@ -349,6 +502,19 @@ function Sync-PortFromEnv {
     catch {}
 }
 
+function Sync-PortFromUserConfig {
+    if ($PortExplicit) { return }
+    $configPath = Get-ProjectPath "user_config.json"
+    if (-not (Test-Path -LiteralPath $configPath)) { return }
+    try {
+        $config = Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json
+        if ($config.runtime.port) {
+            $script:Port = [int]$config.runtime.port
+        }
+    }
+    catch {}
+}
+
 function Test-ShouldScanPath {
     param(
         [Parameter(Mandatory = $true)][string]$RootPath,
@@ -356,7 +522,7 @@ function Test-ShouldScanPath {
         [Parameter(Mandatory = $true)][string]$Name
     )
 
-    if ($Name -like "*.local.*" -or $Name -eq "deepseek-proxy.log.jsonl") {
+    if ($Name -like "*.local.*" -or $Name -eq "events.log.jsonl") {
         return $false
     }
 
@@ -377,16 +543,23 @@ function Get-InstallState {
     $envExists = Test-Path -LiteralPath (Get-ProjectPath ".codex/deepseek.local.env.ps1")
     $userConfigExists = Test-Path -LiteralPath (Get-ProjectPath "user_config.json")
     $runtimeEntryExists = Test-Path -LiteralPath (Get-ProjectPath ".codex/runtime/deepseek_scheduler.py")
-    $legacyShimExists = Test-Path -LiteralPath (Get-ProjectPath ".codex/deepseek_responses_shim.py")
-    if (-not ($configExists -or $workerExists -or $envExists -or $userConfigExists -or $runtimeEntryExists -or $legacyShimExists)) { return "not_installed" }
+    $legacyArtifacts = @(
+        ".codex/deepseek-responses-shim.ps1",
+        ".codex/deepseek_responses_shim.py",
+        ".codex/test-deepseek-direct.ps1",
+        ".codex/test-deepseek-direct.sh",
+        ".codex/test-responses-proxy.ps1",
+        ".codex/test-responses-proxy.sh"
+    ) | Where-Object { Test-Path -LiteralPath (Get-ProjectPath $_) }
+    if (-not ($configExists -or $workerExists -or $envExists -or $userConfigExists -or $runtimeEntryExists -or $legacyArtifacts.Count)) { return "not_installed" }
     if ($runtimeEntryExists -and $configExists -and $workerExists -and $envExists -and $userConfigExists) { return "ok" }
-    if ($legacyShimExists -and -not $runtimeEntryExists) { return "stale_legacy_runtime" }
+    if ($legacyArtifacts.Count -and -not $runtimeEntryExists) { return "stale_legacy_runtime" }
     if (-not $runtimeEntryExists) { return "stale_missing_runtime" }
     return "incomplete"
 }
 
 function Get-ProxyStatus {
-    $pidFile = Get-ProjectPath ".codex/deepseek-proxy.pid"
+    $pidFile = Get-ProjectPath ".codex/runtime/runtime.pid"
     $status = [ordered]@{
         proxy_pid_exists = Test-Path -LiteralPath $pidFile
         proxy_process_alive = $false
@@ -582,7 +755,11 @@ function Stop-Proxy {
 }
 
 function Test-Proxy {
-    Invoke-RuntimeCli -RuntimeCommand "test-proxy"
+    Invoke-RuntimeCli -RuntimeCommand "test-runtime"
+}
+
+function Test-Runtime {
+    Invoke-RuntimeCli -RuntimeCommand "test-runtime"
 }
 
 function Invoke-Doctor {
@@ -608,7 +785,7 @@ function Invoke-Analyze {
 }
 
 function Show-Usage {
-    $log = Get-ProjectPath ".codex/deepseek-proxy.log.jsonl"
+    $log = Get-ProjectPath ".codex/runtime/events.log.jsonl"
     if (-not (Test-Path -LiteralPath $log)) {
         Write-Step "No usage log found: $log"
         return
@@ -680,7 +857,9 @@ function Export-Shareable {
             elseif (Test-Path -LiteralPath $path -PathType Container) {
                 Get-ChildItem -LiteralPath $path -Recurse -File | Where-Object {
                     (-not ($_.Name -like "*.local.*" -and $_.Name -notlike "*.tpl")) -and
-                    $_.Name -ne "deepseek-proxy.log.jsonl" -and
+                    $_.Name -ne "events.log.jsonl" -and
+                    $_.Extension -ne ".pyc" -and
+                    $_.FullName -notmatch '\\__pycache__\\' -and
                     $_.FullName -notmatch '\\backups\\'
                 } | ForEach-Object {
                     $relative = $_.FullName.Substring($path.Length).TrimStart('\', '/')
@@ -713,6 +892,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         "stop-proxy" { Stop-Proxy }
         "stop-runtime" { Stop-Proxy }
         "test-proxy" { Test-Proxy }
+        "test-runtime" { Test-Runtime }
         "usage" { Show-Usage }
         "redact" { Invoke-RedactCheck }
         "export-shareable" { Export-Shareable }

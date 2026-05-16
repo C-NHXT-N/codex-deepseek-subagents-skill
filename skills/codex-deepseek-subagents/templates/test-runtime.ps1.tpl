@@ -10,7 +10,7 @@ $headers = @{
 $body = @{
     model = "__MODEL_PS__"
     input = @(
-        @{ role = "user"; content = "Return exactly this JSON and nothing else: {""status"":""proxy-ok""}" }
+        @{ role = "user"; content = "Return exactly this JSON and nothing else: {""status"":""runtime-ok""}" }
     )
     metadata = @{
         deepseek_reasoning_effort = "disabled"
@@ -25,7 +25,7 @@ $response = Invoke-RestMethod -Method Post -Uri "$env:DEEPSEEK_PROXY_BASE_URL/re
     model = $response.model
     model_label = $response.model_label
     output_text = $response.output_text
-    contains_proxy_ok = ([string]$response.output_text).Contains("proxy-ok")
+    contains_runtime_ok = ([string]$response.output_text).Contains("runtime-ok")
     input_tokens = $response.usage.input_tokens
     output_tokens = $response.usage.output_tokens
     reasoning_tokens = $response.usage.reasoning_tokens

@@ -17,7 +17,7 @@ $unixCases = @(
     @{ Root = "/repo"; Full = "/repo/.git/objects/aa"; Name = "aa"; ShouldScan = $false },
     @{ Root = "/repo"; Full = "/repo/backups/file.txt"; Name = "file.txt"; ShouldScan = $false },
     @{ Root = "/repo"; Full = "/repo/.codex/deepseek.local.env.ps1"; Name = "deepseek.local.env.ps1"; ShouldScan = $false },
-    @{ Root = "/repo"; Full = "/repo/.codex/deepseek-proxy.log.jsonl"; Name = "deepseek-proxy.log.jsonl"; ShouldScan = $false },
+    @{ Root = "/repo"; Full = "/repo/.codex/runtime/events.log.jsonl"; Name = "events.log.jsonl"; ShouldScan = $false },
     @{ Root = "/repo"; Full = "/repo/src/file.txt"; Name = "file.txt"; ShouldScan = $true }
 )
 
@@ -25,7 +25,7 @@ $windowsCases = @(
     @{ Root = "C:\repo"; Full = "C:\repo\.git\objects\aa"; Name = "aa"; ShouldScan = $false },
     @{ Root = "C:\repo"; Full = "C:\repo\backups\file.txt"; Name = "file.txt"; ShouldScan = $false },
     @{ Root = "C:\repo"; Full = "C:\repo\folder\secret.local.env.ps1"; Name = "secret.local.env.ps1"; ShouldScan = $false },
-    @{ Root = "C:\repo"; Full = "C:\repo\folder\deepseek-proxy.log.jsonl"; Name = "deepseek-proxy.log.jsonl"; ShouldScan = $false },
+    @{ Root = "C:\repo"; Full = "C:\repo\folder\runtime\events.log.jsonl"; Name = "events.log.jsonl"; ShouldScan = $false },
     @{ Root = "C:\repo"; Full = "C:\repo\src\file.txt"; Name = "file.txt"; ShouldScan = $true }
 )
 
@@ -50,23 +50,38 @@ try {
         ".codex/agents/deepseek-worker.toml",
         ".codex/deepseek.local.env.ps1",
         ".codex/deepseek.local.env.sh",
-        ".codex/deepseek-responses-shim.ps1",
-        ".codex/deepseek_responses_shim.py",
         ".codex/runtime/deepseek_scheduler.py",
         ".codex/runtime/deepseek_runtime.py",
         ".codex/runtime/task_queue.json",
+        ".codex/runtime/sessions.json",
+        ".codex/runtime/events.log.jsonl",
         ".codex/deepseek-codex.cmd",
         ".codex/deepseek-codex.sh",
-        ".codex/test-deepseek-direct.ps1",
-        ".codex/test-deepseek-direct.sh",
-        ".codex/test-responses-proxy.ps1",
-        ".codex/test-responses-proxy.sh"
+        ".codex/test-runtime.ps1",
+        ".codex/test-runtime.sh"
     )
 
     foreach ($rel in $required) {
         $path = Join-Path $tmp.FullName $rel
         if (-not (Test-Path -LiteralPath $path)) {
             throw "Missing expected file: $rel"
+        }
+    }
+
+    Set-Content -LiteralPath (Join-Path $tmp.FullName ".codex/test-responses-proxy.ps1") -Value "# Managed by codex-deepseek-subagents`nWrite-Host 'legacy'" -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $tmp.FullName ".codex/deepseek_responses_shim.py") -Value "# Managed by codex-deepseek-subagents`nprint('legacy')" -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $tmp.FullName ".codex/deepseek-proxy.log.jsonl") -Value "legacy" -Encoding UTF8
+
+    & $script update `
+        -ProjectRoot $tmp.FullName
+
+    foreach ($rel in @(
+        ".codex/test-responses-proxy.ps1",
+        ".codex/deepseek_responses_shim.py",
+        ".codex/deepseek-proxy.log.jsonl"
+    )) {
+        if (Test-Path -LiteralPath (Join-Path $tmp.FullName $rel)) {
+            throw "Legacy artifact was not removed by update: $rel"
         }
     }
 
@@ -90,17 +105,18 @@ try {
     }
 
     $runtimeFiles = @(
-        ".codex/deepseek-proxy.log.jsonl",
-        ".codex/deepseek-proxy.pid",
-        ".codex/deepseek-proxy.stdout.log",
-        ".codex/deepseek-proxy.stderr.log",
-        ".codex/runtime/task_queue.json"
+        ".codex/runtime/events.log.jsonl",
+        ".codex/runtime/runtime.pid",
+        ".codex/runtime/stdout.log",
+        ".codex/runtime/stderr.log",
+        ".codex/runtime/task_queue.json",
+        ".codex/runtime/sessions.json"
     )
     foreach ($rel in $runtimeFiles) {
         Set-Content -LiteralPath (Join-Path $tmp.FullName $rel) -Value "runtime" -Encoding UTF8
     }
 
-    Set-Content -LiteralPath (Join-Path $tmp.FullName ".codex/test-deepseek-direct.ps1") -Value 'Write-Host "user file"' -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $tmp.FullName ".codex/test-runtime.ps1") -Value 'Write-Host "user file"' -Encoding UTF8
 
     $dryRunOutput = (& $powershellExe -NoProfile -File $script uninstall -ProjectRoot $tmp.FullName -DryRun 2>&1 | Out-String)
 

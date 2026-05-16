@@ -1,42 +1,42 @@
 ---
 name: codex-deepseek-subagents
-description: Install, update, test, or remove a cost-optimized Codex multi-agent setup where GPT acts as planner/reviewer and DeepSeek runs explicit worker tasks through a local scheduler runtime and Responses-compatible shim.
+description: Install, update, test, or remove a cost-optimized Codex multi-agent setup where GPT stays the planner-reviewer and DeepSeek runs through a single Python runtime with visible routing, SSE events, and approved repository tools.
 ---
 
 # Codex DeepSeek Subagents
 
-Use this skill when the user wants GPT to stay as the main Codex planner/reviewer while DeepSeek handles explicit, confirmable worker tasks.
+Use this skill when the user wants Codex/GPT to remain the main planner-reviewer while DeepSeek handles explicit, confirmable worker tasks through the local runtime.
 
 ## Install Flow
 
-Use the official Codex `skill-installer` to install this skill from GitHub. After the skill is present in `CODEX_HOME/skills`, use the bundled installer inside the target project:
+Install the skill with Codex `skill-installer`, then materialize project-local files inside the target repository.
 
-Windows PowerShell:
+Windows PowerShell for the initial install:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 install -ApiKey <deepseek-key>
-powershell -ExecutionPolicy Bypass -File skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 start-runtime
-powershell -ExecutionPolicy Bypass -File skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 test-proxy
-powershell -ExecutionPolicy Bypass -File skills/codex-deepseek-subagents/scripts/deepseek-codex.ps1 doctor
 ```
 
-Linux/macOS shell:
+After install, prefer the generated local wrappers:
+
+```powershell
+.\.codex\deepseek-codex.cmd start-runtime
+.\.codex\deepseek-codex.cmd test-runtime
+.\.codex\deepseek-codex.cmd doctor
+```
+
+Linux/macOS:
 
 ```bash
 bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh install --api-key <deepseek-key>
-bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh start-runtime
-bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh test-proxy
-bash skills/codex-deepseek-subagents/scripts/deepseek-codex.sh doctor
+./.codex/deepseek-codex.sh start-runtime
+./.codex/deepseek-codex.sh test-runtime
+./.codex/deepseek-codex.sh doctor
 ```
 
-Compatibility aliases:
-
-- `start-proxy` -> `start-runtime`
-- `stop-proxy` -> `stop-runtime`
+Compatibility aliases still exist for `start-proxy`, `stop-proxy`, and `test-proxy`, but the canonical command surface is the runtime naming.
 
 ## Managed Files
-
-The installer writes project-local files only:
 
 ```text
 user_config.json
@@ -44,20 +44,24 @@ user_config.json
 .codex/agents/deepseek-worker.toml
 .codex/deepseek.local.env.sh
 .codex/deepseek.local.env.ps1
-.codex/deepseek_responses_shim.py
+.codex/deepseek-codex.cmd
+.codex/deepseek-codex.sh
 .codex/runtime/deepseek_scheduler.py
+.codex/runtime/deepseek_runtime.py
 .codex/runtime/task_queue.json
-.codex/test-deepseek-direct.sh
-.codex/test-deepseek-direct.ps1
-.codex/test-responses-proxy.sh
-.codex/test-responses-proxy.ps1
+.codex/runtime/sessions.json
+.codex/runtime/events.log.jsonl
+.codex/runtime/stdout.log
+.codex/runtime/stderr.log
+.codex/test-runtime.sh
+.codex/test-runtime.ps1
 ```
 
-`user_config.json` is non-secret and shareable. API keys must stay in `.codex/*.local.*` or environment variables only.
+`user_config.json` is shareable and non-secret. API keys must stay in `.codex/*.local.*` or environment variables.
 
 ## Runtime Responsibilities
 
-The local scheduler runtime provides:
+The runtime provides:
 
 - `GET /healthz`
 - `GET /v1/agents`
@@ -66,17 +70,21 @@ The local scheduler runtime provides:
 - `POST /v1/tasks/{task_id}/approve`
 - `POST /v1/tasks/{task_id}/retry`
 - `POST /v1/responses`
+- `POST /v1/sessions`
+- `GET /v1/sessions/{session_id}`
+- `GET /v1/sessions/{session_id}/events`
 
-`/v1/responses` supports two runtime paths:
+`/v1/responses` supports:
 
-- Text compatibility mode for legacy smoke tests and explicit text delegation.
-- Approved native repository tools for `execution` tasks that include a `tool_policy` and are referenced through `metadata.scheduler_task_id`.
+- text delegation
+- approved native repository tools for `execution` tasks
+- `stream=true` through SSE events
 
-`stream=true` is still unsupported. Shell command execution remains disabled in v1.
+Shell command execution remains disabled.
 
 ## Delegation Rules
 
-Before spawning or delegating to DeepSeek, the GPT main agent must tell the user exactly what will be sent:
+Before delegating to DeepSeek, the main agent must describe exactly what will be sent:
 
 ```text
 I can send this to DeepSeek worker now.
@@ -84,36 +92,34 @@ Scope to be sent: <task summary>; files/paths: <list>; exploration allowed: <non
 This may send repository content to DeepSeek or the configured proxy. Confirm before I delegate.
 ```
 
-Default to `listed paths only`. If the task can be done from a summary, send the summary instead of full file contents. There should be no DeepSeek dispatch before the user confirms.
-
-If Codex Desktop says `agent type is currently not available` for `deepseek_worker`, use the `delegate` command as the fallback. It sends only the explicit prompt or prompt file content and does not auto-read repository files.
+Default to `listed paths only`. Prefer `analyze` for read-only repository analysis. There should be no DeepSeek dispatch before user confirmation.
 
 ## Agent Registry
 
-`user_config.json` supports two built-in agent kinds in v1:
+`user_config.json` keeps two built-in agent kinds:
 
-- `codex_main`: logical planner/reviewer route only
-- `deepseek_worker`: real execution worker route
+- `codex_main`
+- `deepseek_worker`
 
-Default routes:
+Default routing:
 
-- `analysis` and `review` -> `codex_main`
+- `analysis` -> `codex_main`
+- `review` -> `codex_main`
 - `execution` -> `deepseek_worker`
 
-Execution tasks require approval through `/v1/tasks/{task_id}/approve` before the scheduler dispatches them. Native repository reads and writes must stay inside the approved tool policy.
+Native repository reads and writes must stay inside the approved tool policy for the execution task.
 
 ## Thinking Mode
 
-Use DeepSeek thinking mode only when it is worth the token cost:
+Use thinking mode only when the task complexity justifies the extra cost:
 
-- Simple edits or formatting: `pro` or `flash`
-- Complex implementation or debugging: `pro-thinking` or `flash-thinking`
-- Ambiguous architecture: max reasoning only after warning about extra cost
+- simple tasks: `pro` or `flash`
+- complex implementation or debugging: `pro-thinking` or `flash-thinking`
 
-Never persist or replay raw `reasoning_content`. Logs should keep token metadata and coarse execution summaries only.
+Do not persist or replay raw `reasoning_content`.
 
 ## Maintenance
 
-- `update` should migrate older shim-only installs to the scheduler runtime.
-- `doctor` should report config presence, registry summary, text-delegation readiness, native tool-agent readiness, supported tools, direct API health, and runtime health separately.
-- `export-shareable` should exclude local secrets, logs, backups, and runtime state.
+- `update` rewrites `user_config.json` into the current schema and removes stale legacy artifacts.
+- `doctor` reports runtime readiness, route display, reasoning stream support, native tool readiness, and stale legacy artifacts separately.
+- `export-shareable` excludes local runtime state, logs, caches, and secrets.

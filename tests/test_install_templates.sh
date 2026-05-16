@@ -22,18 +22,40 @@ required=(
   ".codex/agents/deepseek-worker.toml"
   ".codex/deepseek.local.env.sh"
   ".codex/deepseek.local.env.ps1"
-  ".codex/deepseek_responses_shim.py"
-  ".codex/deepseek-responses-shim.ps1"
   ".codex/runtime/deepseek_scheduler.py"
+  ".codex/runtime/deepseek_runtime.py"
   ".codex/runtime/task_queue.json"
-  ".codex/test-deepseek-direct.sh"
-  ".codex/test-deepseek-direct.ps1"
-  ".codex/test-responses-proxy.sh"
-  ".codex/test-responses-proxy.ps1"
+  ".codex/runtime/sessions.json"
+  ".codex/runtime/events.log.jsonl"
+  ".codex/test-runtime.sh"
+  ".codex/test-runtime.ps1"
+  ".codex/deepseek-codex.cmd"
+  ".codex/deepseek-codex.sh"
 )
 
 for rel in "${required[@]}"; do
   test -f "$tmp/$rel"
+done
+
+cat > "$tmp/.codex/test-responses-proxy.sh" <<'EOF'
+#!/usr/bin/env bash
+# Managed by codex-deepseek-subagents
+echo legacy
+EOF
+cat > "$tmp/.codex/deepseek_responses_shim.py" <<'EOF'
+# Managed by codex-deepseek-subagents
+print("legacy")
+EOF
+: > "$tmp/.codex/deepseek-proxy.log.jsonl"
+
+bash "$script" update \
+  --project-root "$tmp"
+
+for rel in \
+  ".codex/test-responses-proxy.sh" \
+  ".codex/deepseek_responses_shim.py" \
+  ".codex/deepseek-proxy.log.jsonl"; do
+  test ! -e "$tmp/$rel"
 done
 
 python3 - <<'PY' "$tmp/user_config.json"
@@ -53,7 +75,7 @@ bash "$script" uninstall \
   --dry-run
 
 mkdir -p "$tmp_conflict/.codex"
-cat > "$tmp_conflict/.codex/test-deepseek-direct.ps1" <<'EOF'
+cat > "$tmp_conflict/.codex/test-runtime.ps1" <<'EOF'
 Write-Host "custom"
 EOF
 

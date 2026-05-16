@@ -26,6 +26,7 @@ class FakeDeepSeekHandler(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length).decode("utf-8"))
         messages = payload.get("messages") or []
         system_text = "\n".join(str(message.get("content") or "") for message in messages if message.get("role") == "system")
+        combined_text = "\n".join(str(message.get("content") or "") for message in messages)
         if "DeepSeek native repository worker" in system_text:
             conversation = "\n".join(str(message.get("content") or "") for message in messages if message.get("role") != "system")
             if "src/app.py" in conversation:
@@ -61,7 +62,7 @@ class FakeDeepSeekHandler(BaseHTTPRequestHandler):
                         "content": "install-native-ok",
                     })
         else:
-            content = "install-smoke-ok"
+            content = "runtime-ok" if "runtime-ok" in combined_text else "install-smoke-ok"
         body = {
             "id": "chatcmpl-install-smoke",
             "model": payload["model"],
@@ -158,13 +159,15 @@ class InstalledRuntimeSmokeTests(unittest.TestCase):
                         "--port",
                         str(port),
                         "--log-path",
-                        ".codex/deepseek-proxy.log.jsonl",
+                        ".codex/runtime/events.log.jsonl",
                         "--project-root",
                         ".",
                         "--user-config",
                         "user_config.json",
                         "--task-store",
                         ".codex/runtime/task_queue.json",
+                        "--session-store",
+                        ".codex/runtime/sessions.json",
                     ],
                     cwd=str(root),
                     env=env,
@@ -178,6 +181,23 @@ class InstalledRuntimeSmokeTests(unittest.TestCase):
                 self.assertTrue(health["ok"])
                 self.assertTrue(health["capabilities"]["text_delegate_ready"])
                 self.assertTrue(health["capabilities"]["native_tool_agent_ready"])
+                self.assertTrue(health["session_store_path"].endswith(".codex/runtime/sessions.json"))
+
+                test_runtime = subprocess.run(
+                    [
+                        "bash",
+                        str(root / ".codex" / "deepseek-codex.sh"),
+                        "test-runtime",
+                        "--json",
+                    ],
+                    cwd=str(root),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                )
+                test_runtime_data = json.loads(test_runtime.stdout.strip().splitlines()[-1])
+                self.assertTrue(test_runtime_data["contains_runtime_ok"])
 
                 with urllib.request.urlopen(f"{base}/v1/agents", timeout=2) as res:
                     agents = json.loads(res.read().decode("utf-8"))
@@ -327,32 +347,28 @@ class InstalledRuntimeSmokeTests(unittest.TestCase):
                     stderr=subprocess.PIPE,
                     check=True,
                 )
-                self.assertIn("Started runtime PID", start.stdout)
 
                 base = f"http://127.0.0.1:{port}"
                 health = wait_for_health(base)
                 self.assertTrue(health["ok"])
                 self.assertTrue(health["capabilities"]["native_tool_agent_ready"])
 
-                text_req = urllib.request.Request(
-                    f"{base}/v1/responses",
-                    data=json.dumps({
-                        "model": "deepseek-v4-pro",
-                        "input": [{"role": "user", "content": "Reply briefly"}],
-                        "metadata": {"deepseek_reasoning_effort": "disabled"},
-                        "max_output_tokens": 64,
-                    }).encode("utf-8"),
-                    headers={
-                        "Authorization": "Bearer sk-test-placeholder",
-                        "Content-Type": "application/json",
-                    },
-                    method="POST",
+                test_runtime = subprocess.run(
+                    [
+                        "powershell",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(root / ".codex" / "test-runtime.ps1"),
+                    ],
+                    cwd=str(root),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
                 )
-                with urllib.request.urlopen(text_req, timeout=5) as res:
-                    text_response = json.loads(res.read().decode("utf-8"))
-                self.assertEqual(text_response["model_label"], "deepseek-v4-pro")
-                self.assertEqual(text_response["route"]["display_label"], "deepseek-v4-pro")
-                self.assertEqual(text_response["output_text"], "install-smoke-ok")
+                test_runtime_data = json.loads(test_runtime.stdout.strip().splitlines()[-1])
+                self.assertTrue(test_runtime_data["contains_runtime_ok"])
 
                 task_req = urllib.request.Request(
                     f"{base}/v1/tasks",

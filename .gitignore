@@ -2,16 +2,8 @@
 .codex/*.local.*
 .codex/config.toml
 .codex/agents/deepseek-worker.toml
-.codex/deepseek-responses-shim.ps1
-.codex/deepseek_responses_shim.py
-.codex/test-deepseek-direct.ps1
-.codex/test-deepseek-direct.sh
-.codex/test-responses-proxy.ps1
-.codex/test-responses-proxy.sh
-.codex/deepseek-proxy.log.jsonl
-.codex/deepseek-proxy.pid
-.codex/deepseek-proxy.stdout.log
-.codex/deepseek-proxy.stderr.log
+.codex/test-runtime.ps1
+.codex/test-runtime.sh
 .codex/backups/
 codex-deepseek-subagents-plugin/
 __pycache__/
@@ -19,3 +11,8 @@ __pycache__/
 
 # Local Codex DeepSeek secrets and logs
 .codex/runtime/task_queue.json
+.codex/runtime/sessions.json
+.codex/runtime/events.log.jsonl
+.codex/runtime/runtime.pid
+.codex/runtime/stdout.log
+.codex/runtime/stderr.log

@@ -12,7 +12,7 @@ import urllib.request
 
 body = {
     "model": os.environ["DEEPSEEK_OPENAI_MODEL"],
-    "input": [{"role": "user", "content": 'Return exactly this JSON and nothing else: {"status":"proxy-ok"}'}],
+    "input": [{"role": "user", "content": 'Return exactly this JSON and nothing else: {"status":"runtime-ok"}'}],
     "metadata": {"deepseek_reasoning_effort": "disabled"},
     "max_output_tokens": 64,
 }
@@ -31,7 +31,7 @@ print(json.dumps({
     "model": data.get("model"),
     "model_label": data.get("model_label"),
     "output_text": data.get("output_text"),
-    "contains_proxy_ok": "proxy-ok" in str(data.get("output_text")),
+    "contains_runtime_ok": "runtime-ok" in str(data.get("output_text")),
     "input_tokens": (data.get("usage") or {}).get("input_tokens"),
     "output_tokens": (data.get("usage") or {}).get("output_tokens"),
     "reasoning_tokens": (data.get("usage") or {}).get("reasoning_tokens"),

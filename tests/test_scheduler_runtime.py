@@ -93,8 +93,9 @@ class SchedulerRuntimeTests(unittest.TestCase):
         (self.root / ".codex" / "runtime").mkdir(parents=True, exist_ok=True)
         (self.root / "src").mkdir(parents=True, exist_ok=True)
         (self.root / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8")
-        self.log_path = self.root / ".codex" / "deepseek-proxy.log.jsonl"
+        self.log_path = self.root / ".codex" / "runtime" / "events.log.jsonl"
         self.task_store_path = self.root / ".codex" / "runtime" / "task_queue.json"
+        self.session_store_path = self.root / ".codex" / "runtime" / "sessions.json"
         self.user_config_path = self.root / "user_config.json"
         self.write_user_config()
         self.upstream_server, self.upstream_thread = self.start_server(FakeDeepSeekHandler)
@@ -170,6 +171,7 @@ class SchedulerRuntimeTests(unittest.TestCase):
             port=0,
             user_config_path=self.user_config_path,
             task_store_path=self.task_store_path,
+            session_store_path=self.session_store_path,
         )
 
     def test_validate_user_config_rejects_api_key(self):
@@ -182,6 +184,28 @@ class SchedulerRuntimeTests(unittest.TestCase):
         state = self.build_state()
         self.assertEqual(state.config["defaults"]["execution_agent"], "DeepSeek Worker")
         self.assertIn("repo_apply_patch", state.config["defaults"]["tool_policy"]["allowed_tools"])
+
+    def test_normalize_user_config_for_write_preserves_values_and_drops_unknown_top_level_keys(self):
+        template = {
+            "runtime": {"port": 4000, "log_level": "info"},
+            "ui": {"default_mode": "stream-cli", "show_reasoning": True},
+            "connected_agents": [
+                {"name": "Codex Main", "kind": "codex_main", "endpoint": "local/codex-main", "enabled": True, "capabilities": [], "defaults": {}},
+                {"name": "DeepSeek Worker", "kind": "deepseek_worker", "endpoint": "local/deepseek-worker", "enabled": True, "capabilities": ["execution"], "defaults": {"mode": "pro-thinking"}},
+            ],
+            "defaults": {"execution_agent": "DeepSeek Worker", "review_agent": "Codex Main", "tool_policy": {"allowed_paths": ["."], "allowed_tools": ["repo_read_file"], "read_extensions": [".py"], "write_extensions": [".py"], "max_file_read_bytes": 1, "max_search_results": 1, "max_tool_steps": 1}},
+        }
+        existing = {
+            "runtime": {"port": 5001},
+            "defaults": {"verbose": False, "default_allowed_tools": ["repo_search_text"]},
+            "deprecated": True,
+        }
+        normalized = SCHEDULER.normalize_user_config_for_write(existing, template)
+        self.assertEqual(normalized["runtime"]["port"], 5001)
+        self.assertFalse(normalized["defaults"]["verbose"])
+        self.assertNotIn("deprecated", normalized)
+        self.assertNotIn("default_allowed_tools", normalized["defaults"])
+        self.assertEqual(normalized["defaults"]["tool_policy"]["allowed_tools"], ["repo_search_text"])
 
     def test_create_text_and_native_tasks(self):
         state = self.build_state()
@@ -259,9 +283,11 @@ class SchedulerRuntimeTests(unittest.TestCase):
             with urllib.request.urlopen(f"{base}/healthz", timeout=2) as res:
                 health = json.loads(res.read().decode("utf-8"))
             self.assertTrue(health["ok"])
+            self.assertTrue(health["capabilities"]["runtime_ready"])
             self.assertTrue(health["capabilities"]["text_delegate_ready"])
             self.assertTrue(health["capabilities"]["native_tool_agent_ready"])
             self.assertTrue(health["capabilities"]["stream_supported"])
+            self.assertTrue(str(health["session_store_path"]).replace("\\", "/").endswith(".codex/runtime/sessions.json"))
 
             text_req = urllib.request.Request(
                 f"{base}/v1/responses",
@@ -416,6 +442,11 @@ class SchedulerRuntimeTests(unittest.TestCase):
             with urllib.request.urlopen(f"{base}/v1/sessions/{session['session_id']}/events", timeout=5) as res:
                 session_events = res.read().decode("utf-8")
             self.assertIn("event: route.selected", session_events)
+            session_store = json.loads(self.session_store_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(session_store["sessions"]), 1)
+            serialized = json.dumps(session_store, ensure_ascii=False)
+            self.assertNotIn("internal reasoning", serialized)
+            self.assertNotIn("hidden scratchpad", serialized)
         finally:
             runtime_server.shutdown()
             runtime_server.server_close()
