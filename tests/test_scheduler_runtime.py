@@ -226,7 +226,7 @@ class SchedulerRuntimeTests(unittest.TestCase):
             "description": "Task that will fail",
             "approval_scope": {"summary": "approved failure test"},
         })
-        original = SCHEDULER.invoke_deepseek_chat
+        original = SCHEDULER.invoke_deepseek_messages
         snapshots = []
         original_save = state.save_task_store
 
@@ -234,15 +234,15 @@ class SchedulerRuntimeTests(unittest.TestCase):
             original_save()
             snapshots.append(json.loads(self.task_store_path.read_text(encoding="utf-8")))
 
-        def fail_chat(_task, mode):
+        def fail_chat(messages, mode, max_tokens, retry=None):
             raise RuntimeError("planned failure")
 
         try:
             state.save_task_store = capture_save
-            SCHEDULER.invoke_deepseek_chat = fail_chat
+            SCHEDULER.invoke_deepseek_messages = fail_chat
             approved = state.approve_task(task["task_id"], {"approval_token": "approved-by-user"})
         finally:
-            SCHEDULER.invoke_deepseek_chat = original
+            SCHEDULER.invoke_deepseek_messages = original
 
         self.assertEqual(approved["status"], "failed")
         statuses = [snapshot["tasks"][0]["status"] for snapshot in snapshots]
@@ -261,7 +261,7 @@ class SchedulerRuntimeTests(unittest.TestCase):
             self.assertTrue(health["ok"])
             self.assertTrue(health["capabilities"]["text_delegate_ready"])
             self.assertTrue(health["capabilities"]["native_tool_agent_ready"])
-            self.assertFalse(health["capabilities"]["stream_supported"])
+            self.assertTrue(health["capabilities"]["stream_supported"])
 
             text_req = urllib.request.Request(
                 f"{base}/v1/responses",
@@ -280,6 +280,8 @@ class SchedulerRuntimeTests(unittest.TestCase):
             with urllib.request.urlopen(text_req, timeout=5) as res:
                 response = json.loads(res.read().decode("utf-8"))
             self.assertEqual(response["status"], "completed")
+            self.assertEqual(response["model_label"], "deepseek-v4-pro")
+            self.assertEqual(response["route"]["display_label"], "deepseek-v4-pro")
             self.assertEqual(response["output_text"], "worker-ok")
 
             native_task_req = urllib.request.Request(
@@ -342,6 +344,8 @@ class SchedulerRuntimeTests(unittest.TestCase):
             with urllib.request.urlopen(tool_req, timeout=5) as res:
                 tool_response = json.loads(res.read().decode("utf-8"))
             self.assertEqual(tool_response["status"], "completed")
+            self.assertEqual(tool_response["model_label"], "deepseek-v4-pro(thinking)")
+            self.assertEqual(tool_response["route"]["display_label"], "deepseek-v4-pro(thinking)")
             self.assertEqual(tool_response["output_text"], "native-tools-ok")
             self.assertEqual((self.root / "src" / "app.py").read_text(encoding="utf-8"), "print('native-ok')\n")
 
@@ -359,6 +363,59 @@ class SchedulerRuntimeTests(unittest.TestCase):
             self.assertNotIn("reasoning_content", log_text)
             self.assertIn("responses_usage", log_text)
             self.assertIn("tool_call", log_text)
+        finally:
+            runtime_server.shutdown()
+            runtime_server.server_close()
+            runtime_thread.join(timeout=2)
+
+    def test_runtime_stream_and_session_endpoints(self):
+        state = self.build_state()
+        handler = SCHEDULER.build_handler(state)
+        runtime_server, runtime_thread = self.start_server(handler)
+        try:
+            base = f"http://127.0.0.1:{runtime_server.server_port}"
+            stream_req = urllib.request.Request(
+                f"{base}/v1/responses",
+                data=json.dumps({
+                    "model": "deepseek-v4-pro",
+                    "input": [{"role": "user", "content": "say ok"}],
+                    "metadata": {"deepseek_reasoning_effort": "disabled"},
+                    "stream": True,
+                    "max_output_tokens": 64,
+                }).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer sk-test-placeholder",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(stream_req, timeout=5) as res:
+                body = res.read().decode("utf-8")
+            self.assertIn("event: route.selected", body)
+            self.assertIn("event: reasoning.delta", body)
+            self.assertIn("event: turn.completed", body)
+
+            session_req = urllib.request.Request(
+                f"{base}/v1/sessions",
+                data=json.dumps({
+                    "model": "deepseek-v4-pro",
+                    "input": [{"role": "user", "content": "say ok"}],
+                    "metadata": {"deepseek_reasoning_effort": "disabled"},
+                    "max_output_tokens": 64,
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(session_req, timeout=5) as res:
+                session = json.loads(res.read().decode("utf-8"))
+            self.assertEqual(session["status"], "completed")
+            self.assertGreater(session["event_count"], 0)
+            with urllib.request.urlopen(f"{base}/v1/sessions/{session['session_id']}", timeout=5) as res:
+                session_info = json.loads(res.read().decode("utf-8"))
+            self.assertEqual(session_info["route"]["display_label"], "deepseek-v4-pro")
+            with urllib.request.urlopen(f"{base}/v1/sessions/{session['session_id']}/events", timeout=5) as res:
+                session_events = res.read().decode("utf-8")
+            self.assertIn("event: route.selected", session_events)
         finally:
             runtime_server.shutdown()
             runtime_server.server_close()

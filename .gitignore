@@ -16,3 +16,6 @@
 codex-deepseek-subagents-plugin/
 __pycache__/
 *.py[cod]
+
+# Local Codex DeepSeek secrets and logs
+.codex/runtime/task_queue.json

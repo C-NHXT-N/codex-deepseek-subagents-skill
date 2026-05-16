@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("install", "update", "uninstall", "doctor", "desktop-doctor", "delegate", "start-proxy", "stop-proxy", "test-proxy", "start-runtime", "stop-runtime", "usage", "redact", "export-shareable")]
+    [ValidateSet("install", "update", "uninstall", "doctor", "desktop-doctor", "delegate", "analyze", "start-proxy", "stop-proxy", "test-proxy", "start-runtime", "stop-runtime", "usage", "redact", "export-shareable")]
     [string]$Command = "doctor",
 
     [string]$ProjectRoot = (Get-Location).Path,
@@ -217,10 +217,13 @@ function Install-OrUpdate {
     Write-ManagedFile (Get-ProjectPath ".codex/deepseek-responses-shim.ps1") (Expand-Template "deepseek-responses-shim.ps1.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/deepseek_responses_shim.py") (Expand-Template "deepseek_responses_shim.py.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/runtime/deepseek_scheduler.py") (Expand-SchedulerSource "deepseek_scheduler.py")
+    Write-ManagedFile (Get-ProjectPath ".codex/runtime/deepseek_runtime.py") (Expand-SchedulerSource "deepseek_runtime.py")
     Write-ManagedFile (Get-ProjectPath ".codex/test-deepseek-direct.ps1") (Expand-Template "test-deepseek-direct.ps1.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/test-deepseek-direct.sh") (Expand-Template "test-deepseek-direct.sh.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/test-responses-proxy.ps1") (Expand-Template "test-responses-proxy.ps1.tpl")
     Write-ManagedFile (Get-ProjectPath ".codex/test-responses-proxy.sh") (Expand-Template "test-responses-proxy.sh.tpl")
+    Write-ManagedFile (Get-ProjectPath ".codex/deepseek-codex.cmd") (Expand-Template "deepseek-codex.cmd.tpl")
+    Write-ManagedFile (Get-ProjectPath ".codex/deepseek-codex.sh") (Expand-Template "deepseek-codex.sh.tpl")
     $taskStorePath = Get-ProjectPath ".codex/runtime/task_queue.json"
     if ((-not (Test-Path -LiteralPath $taskStorePath)) -or $Force) {
         Ensure-Directory (Split-Path -Parent $taskStorePath)
@@ -293,10 +296,13 @@ function Uninstall-Project {
         ".codex/deepseek-responses-shim.ps1",
         ".codex/deepseek_responses_shim.py",
         ".codex/runtime/deepseek_scheduler.py",
+        ".codex/runtime/deepseek_runtime.py",
         ".codex/test-deepseek-direct.ps1",
         ".codex/test-deepseek-direct.sh",
         ".codex/test-responses-proxy.ps1",
-        ".codex/test-responses-proxy.sh"
+        ".codex/test-responses-proxy.sh",
+        ".codex/deepseek-codex.cmd",
+        ".codex/deepseek-codex.sh"
     )
     foreach ($relative in $paths) {
         Remove-ManagedPath (Get-ProjectPath $relative)
@@ -431,6 +437,27 @@ function Start-ProcessCleanEnvironment {
     return $process
 }
 
+function Get-PythonCommand {
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $python) { $python = Get-Command python3 -ErrorAction SilentlyContinue }
+    if (-not $python) { throw "Neither python nor python3 was found." }
+    return $python.Source
+}
+
+function Invoke-RuntimeCli {
+    param(
+        [Parameter(Mandatory = $true)][string]$RuntimeCommand,
+        [string[]]$ExtraArgs = @()
+    )
+    $python = Get-PythonCommand
+    $runtimeCli = Join-Path $SchedulerRoot "deepseek_runtime.py"
+    $arguments = @($runtimeCli, $RuntimeCommand, "--project-root", (Resolve-FullPath $ProjectRoot))
+    if ($PortExplicit) {
+        $arguments += @("--port", [string]$Port)
+    }
+    & $python @arguments @ExtraArgs
+}
+
 function Get-DeepSeekModeSpec {
     param([string]$SelectedMode)
     switch ($SelectedMode) {
@@ -547,176 +574,19 @@ function Test-DeepSeekThinking {
 }
 
 function Start-Proxy {
-    Import-LocalEnv
-    Sync-PortFromEnv
-    $runtime = ".codex/runtime/deepseek_scheduler.py"
-    $runtimePath = Get-ProjectPath $runtime
-    if (-not (Test-Path -LiteralPath $runtimePath)) {
-        throw "Runtime entrypoint is missing: $runtimePath. This install is stale or incomplete; run update first."
-    }
-    $pidFile = Get-ProjectPath ".codex/deepseek-proxy.pid"
-    if (Test-Path -LiteralPath $pidFile) {
-        $oldPid = (Get-Content -Raw -LiteralPath $pidFile).Trim()
-        if ($oldPid -and (Get-Process -Id ([int]$oldPid) -ErrorAction SilentlyContinue)) {
-            try {
-                $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/healthz" -TimeoutSec 2
-                if ($health.ok) {
-                    Write-Step "Runtime already running with PID $oldPid"
-                    return
-                }
-            }
-            catch {
-                Write-Step "Found stale runtime PID $oldPid without health response; restarting."
-                if (-not $DryRun) {
-                    Stop-Process -Id ([int]$oldPid) -Force -ErrorAction SilentlyContinue
-                    Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
-                }
-            }
-        }
-    }
-    if ($DryRun) {
-        Write-Step "Would start runtime: $runtime on port $Port"
-        return
-    }
-    $python = Get-Command python -ErrorAction SilentlyContinue
-    if (-not $python) { $python = Get-Command python3 -ErrorAction SilentlyContinue }
-    if (-not $python) { throw "Neither python nor python3 was found." }
-    $stdout = Get-ProjectPath ".codex/deepseek-proxy.stdout.log"
-    $stderr = Get-ProjectPath ".codex/deepseek-proxy.stderr.log"
-    $process = Start-ProcessCleanEnvironment -FilePath $python.Source -ArgumentList @($runtime, "--port", [string]$Port, "--log-path", ".codex/deepseek-proxy.log.jsonl", "--stdout-log", ".codex/deepseek-proxy.stdout.log", "--stderr-log", ".codex/deepseek-proxy.stderr.log", "--project-root", ".", "--user-config", "user_config.json", "--task-store", ".codex/runtime/task_queue.json") -WorkingDirectory (Resolve-FullPath $ProjectRoot) -StandardOutputPath $stdout -StandardErrorPath $stderr
-    Set-Content -LiteralPath $pidFile -Value $process.Id -Encoding ASCII
-    Write-Step "Started runtime PID $($process.Id) on port $Port"
+    Invoke-RuntimeCli -RuntimeCommand "start-runtime"
 }
 
 function Stop-Proxy {
-    $pidFile = Get-ProjectPath ".codex/deepseek-proxy.pid"
-    if (-not (Test-Path -LiteralPath $pidFile)) {
-        Write-Step "No runtime pid file found."
-        return
-    }
-    $pidText = Get-Content -Raw -LiteralPath $pidFile
-    if ($pidText -and (Get-Process -Id ([int]$pidText) -ErrorAction SilentlyContinue)) {
-        if ($DryRun) {
-            Write-Step "Would stop runtime PID $pidText"
-        }
-        else {
-            Stop-Process -Id ([int]$pidText) -Force
-            Write-Step "Stopped runtime PID $pidText"
-        }
-    }
-    if (-not $DryRun) { Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue }
+    Invoke-RuntimeCli -RuntimeCommand "stop-runtime"
 }
 
 function Test-Proxy {
-    Import-LocalEnv
-    Sync-PortFromEnv
-    $script = Get-ProjectPath ".codex/test-responses-proxy.ps1"
-    & $script
+    Invoke-RuntimeCli -RuntimeCommand "test-proxy"
 }
 
 function Invoke-Doctor {
-    $checks = [ordered]@{}
-    $checks.project_root = Resolve-FullPath $ProjectRoot
-    $checks.user_config_exists = Test-Path -LiteralPath (Get-ProjectPath "user_config.json")
-    $checks.config_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/config.toml")
-    $checks.worker_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/agents/deepseek-worker.toml")
-    $checks.env_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/deepseek.local.env.ps1")
-    $checks.legacy_shim_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/deepseek_responses_shim.py")
-    $checks.runtime_entry_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/runtime/deepseek_scheduler.py")
-    $checks.runtime_task_store_exists = Test-Path -LiteralPath (Get-ProjectPath ".codex/runtime/task_queue.json")
-    $checks.install_state = Get-InstallState
-    $proxyStatus = Get-ProxyStatus
-    foreach ($key in $proxyStatus.Keys) {
-        $checks[$key] = $proxyStatus[$key]
-    }
-    $checks.env_ignored = $false
-    $gitignore = Get-ProjectPath ".gitignore"
-    if (Test-Path -LiteralPath $gitignore) {
-        $gitignoreText = Get-Content -Raw -LiteralPath $gitignore
-        $checks.env_ignored = $gitignoreText.Contains(".codex/*.local.*")
-    }
-    if ($checks.env_exists) {
-        try {
-            Import-LocalEnv
-            Sync-PortFromEnv
-        }
-        catch {
-            $checks.env_load_error = $_.Exception.Message
-        }
-    }
-    if ($checks.user_config_exists) {
-        try {
-            $userConfig = Get-Content -Raw -LiteralPath (Get-ProjectPath "user_config.json") | ConvertFrom-Json
-            $userConfigPropertyNames = @($userConfig.PSObject.Properties.Name)
-            $checks.user_config_valid = (-not ($userConfigPropertyNames -contains "deepseek_api_key")) -and
-                ($userConfigPropertyNames -contains "runtime") -and
-                ($userConfigPropertyNames -contains "connected_agents") -and
-                ($userConfigPropertyNames -contains "defaults") -and
-                ($null -ne $userConfig.defaults.tool_policy)
-            $checks.agent_registry_summary = @($userConfig.connected_agents | Where-Object { $_.enabled -ne $false } | ForEach-Object {
-                [ordered]@{
-                    name = $_.name
-                    kind = $_.kind
-                    endpoint = $_.endpoint
-                }
-            })
-        }
-        catch {
-            $checks.user_config_valid = $false
-            $checks.user_config_error = $_.Exception.Message
-        }
-    }
-    $checks.collaboration_capabilities = [ordered]@{
-        text_delegate_ready = $checks.user_config_valid -and $checks.runtime_entry_exists -and $checks.env_exists
-        native_tool_agent_ready = $checks.user_config_valid -and $checks.runtime_entry_exists
-        responses_smoke_test = $true
-        responses_tool_calling = $true
-        supported_tools = @("repo_list_files", "repo_read_file", "repo_search_text", "repo_apply_patch", "repo_write_file", "repo_delete_file")
-        unsupported_responses_features = @("stream=true")
-        stream_supported = $false
-        shell_supported = $false
-        note = "Runtime supports approved native repository tools through execution tasks. Shell command execution remains disabled."
-    }
-    try {
-        $checks.direct_api = Test-DeepSeekDirect
-    }
-    catch {
-        $checks.direct_api_error = $_.Exception.Message
-        $checks.direct_api_error_category = Convert-ErrorCategory $_.Exception.Message
-    }
-    try {
-        $checks.thinking = Test-DeepSeekThinking
-    }
-    catch {
-        $checks.thinking_error = $_.Exception.Message
-        $checks.thinking_error_category = Convert-ErrorCategory $_.Exception.Message
-    }
-    try {
-        $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/healthz" -TimeoutSec 2
-        $checks.runtime_health = $health
-    }
-    catch {
-        if (-not $checks.runtime_entry_exists) {
-            $checks.runtime_health_error = "Runtime entrypoint is missing. This install is stale or incomplete; run update first."
-            $checks.runtime_health_error_category = "stale_install"
-        }
-        elseif ($checks.proxy_pid_exists -and $checks.proxy_process_alive) {
-            $checks.runtime_health_error = "Runtime process exists but did not answer /healthz on port $Port."
-            $checks.runtime_health_error_category = "proxy_unhealthy"
-        }
-        else {
-            $checks.runtime_health_error = "Runtime is not running on port $Port. Run start-runtime."
-            $checks.runtime_health_error_category = "proxy_not_running"
-        }
-    }
-    $checks.desktop_native_subagent = [ordered]@{
-        configured_agent = "deepseek_worker"
-        worker_config_exists = $checks.worker_exists
-        registry_status = "not_verifiable_from_script"
-        note = "If Codex Desktop returns 'agent type is currently not available', use the delegate fallback. Skills cannot force Desktop to render a native subagent card."
-        fallback_command = "delegate -Mode pro-thinking -Prompt <task>"
-    }
-    [pscustomobject]$checks | ConvertTo-Json -Depth 8
+    Invoke-RuntimeCli -RuntimeCommand "doctor"
 }
 
 function Invoke-DesktopDoctor {
@@ -724,42 +594,17 @@ function Invoke-DesktopDoctor {
 }
 
 function Invoke-Delegate {
-    if (-not $Prompt -and -not $PromptFile) {
-        throw "delegate requires -Prompt or -PromptFile. It never reads repository files automatically."
-    }
-    if ($Prompt -and $PromptFile) {
-        throw "Use either -Prompt or -PromptFile, not both."
-    }
-    $text = $Prompt
-    if ($PromptFile) {
-        $resolved = Resolve-FullPath $PromptFile
-        if (-not (Test-Path -LiteralPath $resolved)) { throw "PromptFile not found: $resolved" }
-        $text = Get-Content -Raw -LiteralPath $resolved
-    }
-    if ($ThinkingView -eq "summary") {
-        $text = "$text`n`nAt the end of the final answer, add a short section titled 'Reasoning summary'. Summarize only the key decision factors. Do not reveal or restate hidden chain-of-thought or raw reasoning content."
-    }
-    $result = Invoke-DeepSeekChat -SelectedMode $Mode -TokenLimit $MaxTokens -Messages @(@{ role = "user"; content = $text })
-    $output = [ordered]@{
-        ok = $result.ok
-        mode = $result.mode
-        model = $result.model
-        model_label = $result.model_label
-        thinking_type = $result.thinking_type
-        reasoning_effort = $result.reasoning_effort
-        thinking_view = $ThinkingView
-        prompt_chars_sent = $text.Length
-        prompt_tokens = $result.prompt_tokens
-        completion_tokens = $result.completion_tokens
-        reasoning_tokens = $result.reasoning_tokens
-        total_tokens = $result.total_tokens
-        reasoning_content_discarded = ($ThinkingView -ne "raw")
-        content = $result.content
-    }
-    if ($ThinkingView -eq "raw") {
-        $output["reasoning_content"] = $result.reasoning_content
-    }
-    [pscustomobject]$output | ConvertTo-Json -Depth 8
+    $extraArgs = @("--mode", $Mode, "--max-tokens", [string]$MaxTokens)
+    if ($Prompt) { $extraArgs += @("--prompt", $Prompt) }
+    if ($PromptFile) { $extraArgs += @("--prompt-file", (Resolve-FullPath $PromptFile)) }
+    if ($ThinkingView -eq "raw") { $extraArgs += "--verbose" }
+    Invoke-RuntimeCli -RuntimeCommand "delegate" -ExtraArgs $extraArgs
+}
+
+function Invoke-Analyze {
+    $extraArgs = @("--mode", $Mode, "--max-tokens", [string]$MaxTokens, "--yes")
+    if ($Prompt) { $extraArgs += @("--prompt", $Prompt) }
+    Invoke-RuntimeCli -RuntimeCommand "analyze" -ExtraArgs $extraArgs
 }
 
 function Show-Usage {
@@ -862,6 +707,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         "doctor" { Invoke-Doctor }
         "desktop-doctor" { Invoke-DesktopDoctor }
         "delegate" { Invoke-Delegate }
+        "analyze" { Invoke-Analyze }
         "start-proxy" { Start-Proxy }
         "start-runtime" { Start-Proxy }
         "stop-proxy" { Stop-Proxy }

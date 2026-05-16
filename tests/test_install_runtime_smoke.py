@@ -236,6 +236,30 @@ class InstalledRuntimeSmokeTests(unittest.TestCase):
                     response = json.loads(res.read().decode("utf-8"))
                 self.assertEqual(response["status"], "completed")
                 self.assertEqual(response["output_text"], "install-native-ok")
+
+                analyze = subprocess.run(
+                    [
+                        sys.executable,
+                        str(root / ".codex" / "runtime" / "deepseek_runtime.py"),
+                        "analyze",
+                        "--project-root",
+                        str(root),
+                        "--prompt",
+                        "Analyze README.md only and return a short result.",
+                        "--paths",
+                        "README.md",
+                        "--json",
+                    ],
+                    cwd=str(root),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                    env=env,
+                )
+                analyze_data = json.loads(analyze.stdout)
+                self.assertEqual(analyze_data["route"]["display_label"], "deepseek-v4-pro(thinking)")
+                self.assertEqual(analyze_data["content"], "install-native-ok")
             finally:
                 if runtime is not None:
                     runtime.terminate()
@@ -326,6 +350,8 @@ class InstalledRuntimeSmokeTests(unittest.TestCase):
                 )
                 with urllib.request.urlopen(text_req, timeout=5) as res:
                     text_response = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(text_response["model_label"], "deepseek-v4-pro")
+                self.assertEqual(text_response["route"]["display_label"], "deepseek-v4-pro")
                 self.assertEqual(text_response["output_text"], "install-smoke-ok")
 
                 task_req = urllib.request.Request(
@@ -388,6 +414,8 @@ class InstalledRuntimeSmokeTests(unittest.TestCase):
                 with urllib.request.urlopen(tool_req, timeout=5) as res:
                     native_response = json.loads(res.read().decode("utf-8"))
                 self.assertEqual(native_response["status"], "completed")
+                self.assertEqual(native_response["model_label"], "deepseek-v4-pro(thinking)")
+                self.assertEqual(native_response["route"]["display_label"], "deepseek-v4-pro(thinking)")
                 self.assertEqual(native_response["output_text"], "install-native-e2e-ok")
 
                 with urllib.request.urlopen(f"{base}/v1/tasks/{task['task_id']}", timeout=5) as res:

@@ -23,6 +23,7 @@ $response = Invoke-RestMethod -Method Post -Uri "$env:DEEPSEEK_PROXY_BASE_URL/re
     id = $response.id
     status = $response.status
     model = $response.model
+    model_label = $response.model_label
     output_text = $response.output_text
     contains_proxy_ok = ([string]$response.output_text).Contains("proxy-ok")
     input_tokens = $response.usage.input_tokens
@@ -30,5 +31,4 @@ $response = Invoke-RestMethod -Method Post -Uri "$env:DEEPSEEK_PROXY_BASE_URL/re
     reasoning_tokens = $response.usage.reasoning_tokens
     total_tokens = $response.usage.total_tokens
 } | ConvertTo-Json -Compress
-
 

@@ -1,4 +1,4 @@
-# Managed by codex-deepseek-subagents
+﻿# Managed by codex-deepseek-subagents
 import argparse
 import copy
 import json
@@ -24,7 +24,6 @@ SUPPORTED_NATIVE_TOOLS = (
     "repo_write_file",
     "repo_delete_file",
 )
-SUPPORTED_MODES = ("pro-thinking", "flash-thinking", "pro", "flash")
 DEFAULT_ALLOWED_TOOLS = [
     "repo_list_files",
     "repo_read_file",
@@ -75,10 +74,9 @@ DEFAULT_WRITE_EXTENSIONS = [
 ]
 DEFAULT_MAX_TOOL_STEPS = 12
 try:
-    DEFAULT_PORT = int("__PORT__")
+    DEFAULT_PORT = int("4000")
 except ValueError:
     DEFAULT_PORT = 4000
-DISABLED_THINKING_VALUES = {"disabled", "none", "low-cost", "off", "false", "0"}
 
 
 class PolicyError(RuntimeError):
@@ -108,23 +106,6 @@ def append_log(log_path, entry):
     payload = {"ts": utc_now(), **entry}
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
-
-
-def build_sse_payload(event):
-    return f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
-
-
-def write_sse_headers(handler):
-    handler.send_response(200)
-    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
-    handler.send_header("Cache-Control", "no-cache")
-    handler.send_header("Connection", "close")
-    handler.end_headers()
-
-
-def write_sse_event(handler, event):
-    handler.wfile.write(build_sse_payload(event))
-    handler.wfile.flush()
 
 
 def response_input_to_messages(response_input):
@@ -312,21 +293,6 @@ def validate_user_config(config):
         raise ValueError("runtime.port must be an integer")
     if not isinstance(runtime["log_level"], str):
         raise ValueError("runtime.log_level must be a string")
-    runtime.setdefault("event_transport", "sse")
-    retry = runtime.get("retry") or {}
-    if not isinstance(retry, dict):
-        raise ValueError("runtime.retry must be an object")
-    retry.setdefault("max_attempts", 3)
-    retry.setdefault("backoff_seconds", 1)
-    runtime["retry"] = retry
-
-    ui = config.get("ui") or {}
-    if not isinstance(ui, dict):
-        raise ValueError("ui must be an object")
-    ui.setdefault("default_mode", "stream-cli")
-    ui.setdefault("show_reasoning", True)
-    ui.setdefault("show_tool_timeline", True)
-    ui.setdefault("show_token_usage", True)
 
     connected_agents = config.get("connected_agents")
     if not isinstance(connected_agents, list) or not connected_agents:
@@ -371,7 +337,6 @@ def validate_user_config(config):
         "review_agent",
         next((agent["name"] for agent in normalized_agents if agent["kind"] == "codex_main"), "Codex Main"),
     )
-    defaults.setdefault("verbose", True)
     defaults["tool_policy"] = normalize_tool_policy(defaults.get("tool_policy") or {
         "allowed_tools": defaults.get("default_allowed_tools") or DEFAULT_ALLOWED_TOOLS,
         "allowed_paths": defaults.get("allowed_paths") or [],
@@ -386,7 +351,6 @@ def validate_user_config(config):
         "runtime": runtime,
         "connected_agents": normalized_agents,
         "defaults": defaults,
-        "ui": ui,
     }
     return normalized
 
@@ -419,14 +383,10 @@ def runtime_capabilities():
         "responses_smoke_test": True,
         "responses_tool_calling": True,
         "supported_tools": list(SUPPORTED_NATIVE_TOOLS),
-        "stream_supported": True,
+        "stream_supported": False,
         "shell_supported": False,
-        "unsupported_responses_features": [],
+        "unsupported_responses_features": ["stream=true"],
         "native_tool_agent_note": "Execution tasks can run approved local repository tools through the scheduler. Shell command execution is intentionally disabled in v1.",
-        "interactive_cli_ready": True,
-        "reasoning_stream_ready": True,
-        "route_display_ready": True,
-        "windows_wrapper_ready": True,
     }
 
 
@@ -471,106 +431,26 @@ def build_task_prompt(task):
 def mode_to_model_spec(selected_mode):
     if selected_mode == "pro-thinking":
         return {
-            "model": os.environ.get("DEEPSEEK_OPENAI_MODEL") or "__MODEL_SH__",
+            "model": os.environ.get("DEEPSEEK_OPENAI_MODEL") or "deepseek-v4-pro",
             "thinking": {"type": "enabled", "reasoning_effort": "high"},
         }
     if selected_mode == "flash-thinking":
         return {
-            "model": os.environ.get("DEEPSEEK_OPENAI_FAST_MODEL") or os.environ.get("DEEPSEEK_OPENAI_MODEL") or "__FAST_MODEL_SH__",
+            "model": os.environ.get("DEEPSEEK_OPENAI_FAST_MODEL") or os.environ.get("DEEPSEEK_OPENAI_MODEL") or "deepseek-v4-flash",
             "thinking": {"type": "enabled", "reasoning_effort": "high"},
         }
     if selected_mode == "flash":
         return {
-            "model": os.environ.get("DEEPSEEK_OPENAI_FAST_MODEL") or os.environ.get("DEEPSEEK_OPENAI_MODEL") or "__FAST_MODEL_SH__",
+            "model": os.environ.get("DEEPSEEK_OPENAI_FAST_MODEL") or os.environ.get("DEEPSEEK_OPENAI_MODEL") or "deepseek-v4-flash",
             "thinking": {"type": "disabled"},
         }
     return {
-        "model": os.environ.get("DEEPSEEK_OPENAI_MODEL") or "__MODEL_SH__",
+        "model": os.environ.get("DEEPSEEK_OPENAI_MODEL") or "deepseek-v4-pro",
         "thinking": {"type": "disabled"} if selected_mode == "pro" else {"type": "enabled", "reasoning_effort": "high"},
     }
 
 
-def mode_family(selected_mode):
-    return "flash" if str(selected_mode or "").startswith("flash") else "pro"
-
-
-def thinking_enabled_for_mode(selected_mode):
-    return str(selected_mode or "").endswith("thinking")
-
-
-def select_mode(requested_mode=None, requested_model=None, effort=None, default_mode="pro-thinking"):
-    mode = str(requested_mode or "").strip()
-    if mode in SUPPORTED_MODES:
-        return mode
-
-    default_mode = default_mode if default_mode in SUPPORTED_MODES else "pro-thinking"
-    base = mode_family(default_mode)
-    if requested_model:
-        fast_model = os.environ.get("DEEPSEEK_OPENAI_FAST_MODEL") or ""
-        requested_model_text = str(requested_model)
-        if requested_model_text == fast_model or "flash" in requested_model_text.lower():
-            base = "flash"
-        else:
-            base = "pro"
-
-    if effort is None or str(effort).strip() == "":
-        enabled = thinking_enabled_for_mode(default_mode)
-    else:
-        enabled = str(effort).strip().lower() not in DISABLED_THINKING_VALUES
-    return f"{base}-thinking" if enabled else base
-
-
-def build_route(selected_mode, resolved_model=None):
-    spec = mode_to_model_spec(selected_mode)
-    model = resolved_model or spec["model"]
-    thinking = spec["thinking"]
-    display_label = f"{model}(thinking)" if thinking["type"] == "enabled" else model
-    return {
-        "requested_mode": selected_mode,
-        "resolved_model": model,
-        "thinking_type": thinking["type"],
-        "reasoning_effort": thinking.get("reasoning_effort"),
-        "display_label": display_label,
-        "model_family": mode_family(selected_mode),
-    }
-
-
-def usage_from_result(result):
-    return {
-        "input_tokens": result.get("prompt_tokens"),
-        "output_tokens": result.get("completion_tokens"),
-        "total_tokens": result.get("total_tokens"),
-        "reasoning_tokens": result.get("reasoning_tokens"),
-    }
-
-
-def make_event(event_type, step=None, message="", status=None, route=None, data=None):
-    event = {
-        "event_id": f"evt_{uuid4().hex}",
-        "ts": utc_now(),
-        "type": event_type,
-    }
-    if step:
-        event["step"] = step
-    if message:
-        event["message"] = message
-    if status:
-        event["status"] = status
-    if route is not None:
-        event["route"] = route
-    if data is not None:
-        event["data"] = data
-    return event
-
-
-def emit_event(event_sink, event_type, step=None, message="", status=None, route=None, data=None):
-    event = make_event(event_type, step=step, message=message, status=status, route=route, data=data)
-    if event_sink:
-        event_sink(event)
-    return event
-
-
-def invoke_deepseek_messages(messages, mode, max_tokens, retry=None):
+def invoke_deepseek_messages(messages, mode, max_tokens):
     if not os.environ.get("DEEPSEEK_API_KEY"):
         raise RuntimeError("DEEPSEEK_API_KEY is not set.")
     spec = mode_to_model_spec(mode)
@@ -591,24 +471,8 @@ def invoke_deepseek_messages(messages, mode, max_tokens, retry=None):
         headers={"Authorization": f"Bearer {os.environ['DEEPSEEK_API_KEY']}", "Content-Type": "application/json"},
         method="POST",
     )
-    retry_policy = copy.deepcopy(retry or {})
-    max_attempts = int(retry_policy.get("max_attempts") or 1)
-    backoff_seconds = float(retry_policy.get("backoff_seconds") or 0)
-    data = None
-    last_error = None
-    for attempt_index in range(max_attempts):
-        try:
-            with urllib.request.urlopen(req, timeout=300) as upstream:
-                data = json.loads(upstream.read().decode("utf-8"))
-            last_error = None
-            break
-        except Exception as exc:
-            last_error = exc
-            if attempt_index + 1 >= max_attempts:
-                break
-            time.sleep(backoff_seconds * (2 ** attempt_index))
-    if last_error is not None:
-        raise last_error
+    with urllib.request.urlopen(req, timeout=300) as upstream:
+        data = json.loads(upstream.read().decode("utf-8"))
     message = data["choices"][0]["message"]
     usage = data.get("usage") or {}
     details = usage.get("completion_tokens_details") or {}
@@ -631,211 +495,6 @@ def invoke_deepseek_chat(task, mode):
         mode=mode,
         max_tokens=2048,
     )
-
-
-def run_text_turn(messages, selected_mode, max_tokens, retry=None, event_sink=None):
-    initial_route = build_route(selected_mode)
-    emit_event(
-        event_sink,
-        "route.selected",
-        step="routing",
-        message=f"Model: {initial_route['model_family']} | Thinking: {'ON' if initial_route['thinking_type'] == 'enabled' else 'OFF'}",
-        status="routing",
-        route=initial_route,
-    )
-    emit_event(
-        event_sink,
-        "step.started",
-        step="reasoning",
-        message="Sending request to DeepSeek.",
-        status="reasoning",
-        route=initial_route,
-    )
-    result = invoke_deepseek_messages(messages, mode=selected_mode, max_tokens=max_tokens, retry=retry)
-    route = build_route(selected_mode, result.get("model"))
-    reasoning_content = str(result.get("reasoning_content") or "")
-    if reasoning_content:
-        emit_event(
-            event_sink,
-            "reasoning.delta",
-            step="reasoning",
-            message=reasoning_content,
-            status="reasoning",
-            route=route,
-            data={"chars": len(reasoning_content)},
-        )
-    content = str(result.get("content") or "")
-    emit_event(
-        event_sink,
-        "assistant.delta",
-        step="final",
-        message=content,
-        status="completed",
-        route=route,
-    )
-    emit_event(
-        event_sink,
-        "turn.completed",
-        step="final",
-        message="DeepSeek turn completed.",
-        status="completed",
-        route=route,
-        data={"usage": usage_from_result(result), "content": content},
-    )
-    return {
-        "content": content,
-        "result": result,
-        "route": route,
-        "usage": usage_from_result(result),
-    }
-
-
-def run_native_tool_turn(state, task, allowed_tool_names, user_messages, max_output_tokens, selected_mode, event_sink=None):
-    route = build_route(selected_mode)
-    emit_event(
-        event_sink,
-        "route.selected",
-        step="routing",
-        message=f"Model: {route['model_family']} | Thinking: {'ON' if route['thinking_type'] == 'enabled' else 'OFF'}",
-        status="routing",
-        route=route,
-    )
-    emit_event(
-        event_sink,
-        "approval.required",
-        step="approval",
-        message="Execution scope has been approved for native repository tools.",
-        status="approved",
-        route=route,
-        data={
-            "summary": task.get("approval_scope", {}).get("summary"),
-            "allowed_paths": task.get("tool_policy", {}).get("allowed_paths"),
-            "allowed_tools": allowed_tool_names,
-        },
-    )
-    state.begin_native_tool_session(task)
-    messages = build_native_tool_messages(task, user_messages, allowed_tool_names)
-    usage = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0}
-    tool_steps = []
-    retry_policy = state.config.get("runtime", {}).get("retry")
-
-    try:
-        for step in range(task["tool_policy"]["max_tool_steps"]):
-            emit_event(
-                event_sink,
-                "step.started",
-                step="reasoning",
-                message=f"DeepSeek reasoning turn {step + 1} started.",
-                status="reasoning",
-                route=route,
-            )
-            result = invoke_deepseek_messages(messages, mode=selected_mode, max_tokens=max_output_tokens, retry=retry_policy)
-            route = build_route(selected_mode, result.get("model"))
-            usage["prompt_tokens"] += int(result.get("prompt_tokens") or 0)
-            usage["completion_tokens"] += int(result.get("completion_tokens") or 0)
-            usage["reasoning_tokens"] += int(result.get("reasoning_tokens") or 0)
-            usage["total_tokens"] += int(result.get("total_tokens") or 0)
-
-            reasoning_content = str(result.get("reasoning_content") or "")
-            if reasoning_content:
-                emit_event(
-                    event_sink,
-                    "reasoning.delta",
-                    step="reasoning",
-                    message=reasoning_content,
-                    status="reasoning",
-                    route=route,
-                    data={"chars": len(reasoning_content), "turn": step + 1},
-                )
-
-            parsed = parse_tool_loop_response(result.get("content"))
-            if parsed["type"] == "final":
-                emit_event(
-                    event_sink,
-                    "assistant.delta",
-                    step="final",
-                    message=str(parsed["content"] or ""),
-                    status="completed",
-                    route=route,
-                )
-                state.complete_native_tool_session(task, result | {"content": parsed["content"], "route": route}, usage, tool_steps)
-                emit_event(
-                    event_sink,
-                    "turn.completed",
-                    step="final",
-                    message="Native tool execution completed.",
-                    status="completed",
-                    route=route,
-                    data={"usage": usage, "content": parsed["content"], "tool_steps": tool_steps},
-                )
-                return {
-                    "content": str(parsed["content"] or ""),
-                    "result": result,
-                    "route": route,
-                    "usage": usage,
-                    "tool_steps": tool_steps,
-                }
-
-            tool_name = parsed["tool_name"]
-            if tool_name not in allowed_tool_names:
-                raise PolicyError(f"Tool is not allowed by response request: {tool_name}")
-            target = parsed["arguments"].get("path") or parsed["arguments"].get("directory") or parsed["arguments"].get("query") or ""
-            emit_event(
-                event_sink,
-                "tool.call.started",
-                step="tool_call",
-                message=f"{tool_name} -> {target}",
-                status="tool_call",
-                route=route,
-                data={"tool_name": tool_name, "target": target, "turn": step + 1},
-            )
-            if tool_name == "repo_apply_patch":
-                emit_event(
-                    event_sink,
-                    "patch.preview",
-                    step="patch_preview",
-                    message="Patch preview generated.",
-                    status="patch_ready",
-                    route=route,
-                    data={"patch": parsed["arguments"].get("patch") or "", "target": target},
-                )
-            tool_result = state.execute_native_tool(task, tool_name, parsed["arguments"])
-            tool_step = {"step": step + 1, "tool_name": tool_name, "target": target}
-            tool_steps.append(tool_step)
-            append_log(state.log_path, {
-                "kind": "tool_call",
-                "task_id": task["task_id"],
-                "tool_name": tool_name,
-                "target": target,
-                "step": step + 1,
-            })
-            emit_event(
-                event_sink,
-                "tool.call.completed",
-                step="tool_call",
-                message=f"{tool_name} completed.",
-                status="tool_call",
-                route=route,
-                data={"tool_name": tool_name, "target": target, "result": tool_result, "turn": step + 1},
-            )
-            messages.append({"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False)})
-            messages.append({
-                "role": "user",
-                "content": "Tool result:\n" + json.dumps({"tool_name": tool_name, "result": tool_result}, ensure_ascii=False, indent=2),
-            })
-        raise TaskConflictError("Native tool loop exceeded max_tool_steps")
-    except Exception as exc:
-        state.fail_native_tool_session(task, exc)
-        emit_event(
-            event_sink,
-            "turn.failed",
-            step="final",
-            message=str(exc),
-            status="failed",
-            route=route,
-            data={"error_category": classify_error(exc)},
-        )
-        raise
 
 
 def parse_jsonish_object(content):
@@ -895,7 +554,6 @@ class RuntimeState:
         self.config = self.load_user_config()
         self.agent_index = build_agent_index(self.config)
         self.task_store = self.load_task_store()
-        self.sessions = {}
 
     def load_user_config(self):
         if not self.user_config_path.exists():
@@ -937,33 +595,6 @@ class RuntimeState:
             "tasks": len(self.task_store["tasks"]),
             "capabilities": runtime_capabilities(),
         }
-
-    def create_session(self, payload):
-        session_id = str(payload.get("session_id") or f"session_{uuid4().hex}")
-        session = {
-            "session_id": session_id,
-            "status": "created",
-            "created_at": utc_now(),
-            "updated_at": utc_now(),
-            "route": None,
-            "summary": {
-                "mode": payload.get("mode") or payload.get("execution_mode") or "text_delegate",
-                "has_tools": bool(payload.get("tools")),
-            },
-            "events": [],
-            "response": None,
-        }
-        self.sessions[session_id] = session
-        return session
-
-    def get_session(self, session_id):
-        return self.sessions.get(session_id)
-
-    def append_session_event(self, session, event):
-        session["events"].append(event)
-        if event.get("route"):
-            session["route"] = event["route"]
-        session["updated_at"] = utc_now()
 
     def create_task(self, payload):
         task_type = str(payload.get("type") or "").strip()
@@ -1117,22 +748,20 @@ class RuntimeState:
         agent = self.agent_index[task["assigned_agent"]]
         mode = str((agent.get("defaults") or {}).get("mode") or "pro-thinking")
         try:
-            turn = run_text_turn(
-                [{"role": "user", "content": build_task_prompt(task)}],
-                selected_mode=mode,
-                max_tokens=2048,
-                retry=self.config.get("runtime", {}).get("retry"),
-            )
-            result = turn["result"]
+            result = invoke_deepseek_chat(task, mode=mode)
             task["result"] = {
-                "content": turn["content"],
+                "content": result["content"],
                 "model": result["model"],
                 "model_label": result["model_label"],
-                "route": turn["route"],
                 "finish_reason": result.get("finish_reason"),
                 "reasoning_content_discarded": True,
             }
-            task["usage"] = turn["usage"]
+            task["usage"] = {
+                "prompt_tokens": result.get("prompt_tokens"),
+                "completion_tokens": result.get("completion_tokens"),
+                "reasoning_tokens": result.get("reasoning_tokens"),
+                "total_tokens": result.get("total_tokens"),
+            }
             task["status"] = "success"
             task["timestamps"]["completed_at"] = utc_now()
             task["timestamps"]["updated_at"] = utc_now()
@@ -1144,10 +773,10 @@ class RuntimeState:
                 "assigned_agent": task["assigned_agent"],
                 "status": task["status"],
                 "execution_mode": task["execution_mode"],
-                "prompt_tokens": task["usage"].get("input_tokens"),
-                "completion_tokens": task["usage"].get("output_tokens"),
-                "reasoning_tokens": task["usage"].get("reasoning_tokens"),
-                "total_tokens": task["usage"].get("total_tokens"),
+                "prompt_tokens": result.get("prompt_tokens"),
+                "completion_tokens": result.get("completion_tokens"),
+                "reasoning_tokens": result.get("reasoning_tokens"),
+                "total_tokens": result.get("total_tokens"),
                 "model": result.get("model"),
                 "model_label": result.get("model_label"),
             })
@@ -1225,7 +854,6 @@ class RuntimeState:
             "content": result["content"],
             "model": result["model"],
             "model_label": result["model_label"],
-            "route": result.get("route"),
             "finish_reason": result.get("finish_reason"),
             "reasoning_content_discarded": True,
             "tool_steps": tool_steps,
@@ -1597,31 +1225,6 @@ def build_handler(state):
                     "capabilities": runtime_capabilities(),
                 })
                 return
-            if self.path.startswith("/v1/sessions/") and self.path.endswith("/events"):
-                session_id = self.path.split("/v1/sessions/", 1)[1].rsplit("/events", 1)[0]
-                session = state.get_session(session_id)
-                if not session:
-                    raise KeyError(session_id)
-                write_sse_headers(self)
-                for event in session["events"]:
-                    write_sse_event(self, event)
-                return
-            if self.path.startswith("/v1/sessions/"):
-                session_id = self.path.split("/v1/sessions/", 1)[1]
-                session = state.get_session(session_id)
-                if not session:
-                    raise KeyError(session_id)
-                write_json(self, 200, {
-                    "session_id": session["session_id"],
-                    "status": session["status"],
-                    "created_at": session["created_at"],
-                    "updated_at": session["updated_at"],
-                    "route": session.get("route"),
-                    "summary": session.get("summary"),
-                    "event_count": len(session.get("events") or []),
-                    "response": session.get("response"),
-                })
-                return
             if self.path.startswith("/v1/tasks/"):
                 task_id = self.path.split("/v1/tasks/", 1)[1]
                 task = state.find_task(task_id)
@@ -1634,9 +1237,6 @@ def build_handler(state):
         def _do_post(self):
             if self.path == "/v1/responses":
                 return self.handle_responses()
-            if self.path == "/v1/sessions":
-                payload = self.read_payload()
-                return self.handle_session_create(payload)
             if self.path == "/v1/tasks":
                 payload = self.read_payload()
                 task = state.create_task(payload)
@@ -1667,39 +1267,34 @@ def build_handler(state):
 
             payload = self.read_payload()
             if payload.get("stream"):
-                return self.handle_streaming_response(payload)
+                write_json(self, 400, {
+                    "error": {
+                        "message": "This scheduler Responses endpoint does not implement stream=true. Use synchronous mode only."
+                    }
+                })
+                return
 
             if payload.get("tools"):
                 return self.handle_native_tools_response(payload)
             return self.handle_text_response(payload)
 
         def handle_text_response(self, payload):
+            model = str(payload.get("model") or os.environ.get("DEEPSEEK_OPENAI_MODEL") or "deepseek-v4-pro")
             messages = response_input_to_messages(payload.get("input"))
             if not messages:
                 messages = [{"role": "user", "content": "Respond with exactly: ok"}]
 
-            effort = str((payload.get("metadata") or {}).get("deepseek_reasoning_effort") or os.environ.get("DEEPSEEK_THINKING_DEFAULT") or "__THINKING_DEFAULT_SH__")
-            selected_mode = select_mode(
-                requested_mode=(payload.get("metadata") or {}).get("deepseek_mode"),
-                requested_model=payload.get("model"),
-                effort=effort,
-                default_mode="pro-thinking",
-            )
-            turn = run_text_turn(
-                messages,
-                selected_mode=selected_mode,
-                max_tokens=int(payload.get("max_output_tokens") or 512),
-                retry=state.config.get("runtime", {}).get("retry"),
-            )
-            result = turn["result"]
-            content = turn["content"]
+            effort = str((payload.get("metadata") or {}).get("deepseek_reasoning_effort") or os.environ.get("DEEPSEEK_THINKING_DEFAULT") or "disabled")
+            thinking_mode = "pro" if effort in {"disabled", "none", "low-cost"} else "pro-thinking"
+            result = invoke_deepseek_messages(messages, mode=thinking_mode, max_tokens=int(payload.get("max_output_tokens") or 512))
+            content = str(result.get("content") or "")
             reasoning_content = str(result.get("reasoning_content") or "")
             append_log(state.log_path, {
                 "kind": "responses_usage",
                 "path": self.path,
-                "model": result.get("model"),
+                "model": model,
                 "model_label": result["model_label"],
-                "thinking_type": turn["route"]["thinking_type"],
+                "thinking_type": "disabled" if thinking_mode == "pro" else "enabled",
                 "request_input_chars": sum(len(m.get("content", "")) for m in messages),
                 "message_count": len(messages),
                 "prompt_tokens": result.get("prompt_tokens"),
@@ -1715,12 +1310,16 @@ def build_handler(state):
                 "created_at": int(time.time()),
                 "status": "completed",
                 "error": None,
-                "model": result.get("model"),
+                "model": model,
                 "model_label": result["model_label"],
-                "route": turn["route"],
                 "output": build_response_output(content),
                 "output_text": content,
-                "usage": turn["usage"],
+                "usage": {
+                    "input_tokens": result.get("prompt_tokens"),
+                    "output_tokens": result.get("completion_tokens"),
+                    "total_tokens": result.get("total_tokens"),
+                    "reasoning_tokens": result.get("reasoning_tokens"),
+                },
             }
             write_json(self, 200, response)
 
@@ -1731,167 +1330,86 @@ def build_handler(state):
             allowed_tool_names = state.allowed_tool_names_for_response(payload.get("tools"), task["tool_policy"])
             if "shell_command" in allowed_tool_names:
                 raise ValueError("shell_command is intentionally disabled in this runtime")
+
+            state.begin_native_tool_session(task)
+            model = str(payload.get("model") or os.environ.get("DEEPSEEK_OPENAI_MODEL") or "deepseek-v4-pro")
             user_messages = response_input_to_messages(payload.get("input"))
+            messages = build_native_tool_messages(task, user_messages, allowed_tool_names)
             agent = state.agent_index[task["assigned_agent"]]
-            agent_default_mode = str((agent.get("defaults") or {}).get("mode") or "pro-thinking")
-            selected_mode = metadata.get("deepseek_mode") or agent_default_mode
-            turn = run_native_tool_turn(
-                state,
-                task,
-                allowed_tool_names,
-                user_messages,
-                int(payload.get("max_output_tokens") or 1024),
-                selected_mode,
-            )
-            append_log(state.log_path, {
-                "kind": "responses_usage",
-                "path": self.path,
-                "model": turn["result"].get("model"),
-                "model_label": turn["result"]["model_label"],
-                "thinking_type": turn["route"]["thinking_type"],
-                "prompt_tokens": turn["usage"]["prompt_tokens"],
-                "completion_tokens": turn["usage"]["completion_tokens"],
-                "reasoning_tokens": turn["usage"]["reasoning_tokens"],
-                "total_tokens": turn["usage"]["total_tokens"],
-                "mode": "native_tools",
-                "task_id": task["task_id"],
-                "tool_step_count": len(turn["tool_steps"]),
-            })
-            response = {
-                "id": f"resp_{uuid4().hex}",
-                "object": "response",
-                "created_at": int(time.time()),
-                "status": "completed",
-                "error": None,
-                "model": turn["result"].get("model"),
-                "model_label": turn["result"]["model_label"],
-                "route": turn["route"],
-                "output": build_response_output(turn["content"]),
-                "output_text": turn["content"],
-                "usage": {
-                    "input_tokens": turn["usage"]["prompt_tokens"],
-                    "output_tokens": turn["usage"]["completion_tokens"],
-                    "total_tokens": turn["usage"]["total_tokens"],
-                    "reasoning_tokens": turn["usage"]["reasoning_tokens"],
-                },
-            }
-            write_json(self, 200, response)
-
-        def handle_streaming_response(self, payload):
-            events = []
-
-            def event_sink(event):
-                events.append(event)
-                write_sse_event(self, event)
-
-            write_sse_headers(self)
-            try:
-                if payload.get("tools"):
-                    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-                    task = state.require_task_for_native_tools(metadata.get("scheduler_task_id"))
-                    allowed_tool_names = state.allowed_tool_names_for_response(payload.get("tools"), task["tool_policy"])
-                    agent = state.agent_index[task["assigned_agent"]]
-                    agent_default_mode = str((agent.get("defaults") or {}).get("mode") or "pro-thinking")
-                    selected_mode = metadata.get("deepseek_mode") or agent_default_mode
-                    turn = run_native_tool_turn(
-                        state,
-                        task,
-                        allowed_tool_names,
-                        response_input_to_messages(payload.get("input")),
-                        int(payload.get("max_output_tokens") or 1024),
-                        selected_mode,
-                        event_sink=event_sink,
-                    )
-                else:
-                    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-                    selected_mode = select_mode(
-                        requested_mode=metadata.get("deepseek_mode"),
-                        requested_model=payload.get("model"),
-                        effort=metadata.get("deepseek_reasoning_effort") or os.environ.get("DEEPSEEK_THINKING_DEFAULT") or "__THINKING_DEFAULT_SH__",
-                        default_mode="pro-thinking",
-                    )
-                    turn = run_text_turn(
-                        response_input_to_messages(payload.get("input")) or [{"role": "user", "content": "Respond with exactly: ok"}],
-                        selected_mode=selected_mode,
-                        max_tokens=int(payload.get("max_output_tokens") or 512),
-                        retry=state.config.get("runtime", {}).get("retry"),
-                        event_sink=event_sink,
-                    )
-                self.close_connection = True
-                return turn
-            except Exception as exc:
-                write_sse_event(self, make_event(
-                    "turn.failed",
-                    step="final",
-                    message=str(exc),
-                    status="failed",
-                    data={"error_category": classify_error(exc)},
-                ))
-                self.close_connection = True
-
-        def handle_session_create(self, payload):
-            session = state.create_session(payload)
-
-            def event_sink(event):
-                state.append_session_event(session, event)
+            mode = str((agent.get("defaults") or {}).get("mode") or "pro-thinking")
+            usage = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0}
+            tool_steps = []
 
             try:
-                if payload.get("tools"):
-                    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-                    task = state.require_task_for_native_tools(metadata.get("scheduler_task_id"))
-                    allowed_tool_names = state.allowed_tool_names_for_response(payload.get("tools"), task["tool_policy"])
-                    agent = state.agent_index[task["assigned_agent"]]
-                    agent_default_mode = str((agent.get("defaults") or {}).get("mode") or "pro-thinking")
-                    selected_mode = metadata.get("deepseek_mode") or agent_default_mode
-                    turn = run_native_tool_turn(
-                        state,
-                        task,
-                        allowed_tool_names,
-                        response_input_to_messages(payload.get("input")),
-                        int(payload.get("max_output_tokens") or 1024),
-                        selected_mode,
-                        event_sink=event_sink,
-                    )
-                else:
-                    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-                    selected_mode = select_mode(
-                        requested_mode=metadata.get("deepseek_mode"),
-                        requested_model=payload.get("model"),
-                        effort=metadata.get("deepseek_reasoning_effort") or os.environ.get("DEEPSEEK_THINKING_DEFAULT") or "__THINKING_DEFAULT_SH__",
-                        default_mode="pro-thinking",
-                    )
-                    turn = run_text_turn(
-                        response_input_to_messages(payload.get("input")) or [{"role": "user", "content": "Respond with exactly: ok"}],
-                        selected_mode=selected_mode,
-                        max_tokens=int(payload.get("max_output_tokens") or 512),
-                        retry=state.config.get("runtime", {}).get("retry"),
-                        event_sink=event_sink,
-                    )
-                session["status"] = "completed"
-                session["route"] = turn["route"]
-                session["response"] = {
-                    "content": turn["content"],
-                    "usage": turn["usage"],
-                    "route": turn["route"],
-                }
-                session["updated_at"] = utc_now()
-                write_json(self, 201, {
-                    "session_id": session["session_id"],
-                    "status": session["status"],
-                    "route": session["route"],
-                    "event_count": len(session["events"]),
-                    "response": session["response"],
-                })
+                for step in range(task["tool_policy"]["max_tool_steps"]):
+                    result = invoke_deepseek_messages(messages, mode=mode, max_tokens=int(payload.get("max_output_tokens") or 1024))
+                    usage["prompt_tokens"] += int(result.get("prompt_tokens") or 0)
+                    usage["completion_tokens"] += int(result.get("completion_tokens") or 0)
+                    usage["reasoning_tokens"] += int(result.get("reasoning_tokens") or 0)
+                    usage["total_tokens"] += int(result.get("total_tokens") or 0)
+
+                    parsed = parse_tool_loop_response(result.get("content"))
+                    if parsed["type"] == "final":
+                        append_log(state.log_path, {
+                            "kind": "responses_usage",
+                            "path": self.path,
+                            "model": model,
+                            "model_label": result["model_label"],
+                            "thinking_type": "enabled" if "thinking" in result["model_label"] else "disabled",
+                            "prompt_tokens": usage["prompt_tokens"],
+                            "completion_tokens": usage["completion_tokens"],
+                            "reasoning_tokens": usage["reasoning_tokens"],
+                            "total_tokens": usage["total_tokens"],
+                            "mode": "native_tools",
+                            "task_id": task["task_id"],
+                            "tool_step_count": len(tool_steps),
+                        })
+                        state.complete_native_tool_session(task, result | {"content": parsed["content"]}, usage, tool_steps)
+                        response = {
+                            "id": f"resp_{uuid4().hex}",
+                            "object": "response",
+                            "created_at": int(time.time()),
+                            "status": "completed",
+                            "error": None,
+                            "model": model,
+                            "model_label": result["model_label"],
+                            "output": build_response_output(parsed["content"]),
+                            "output_text": parsed["content"],
+                            "usage": {
+                                "input_tokens": usage["prompt_tokens"],
+                                "output_tokens": usage["completion_tokens"],
+                                "total_tokens": usage["total_tokens"],
+                                "reasoning_tokens": usage["reasoning_tokens"],
+                            },
+                        }
+                        write_json(self, 200, response)
+                        return
+
+                    tool_name = parsed["tool_name"]
+                    if tool_name not in allowed_tool_names:
+                        raise PolicyError(f"Tool is not allowed by response request: {tool_name}")
+                    tool_result = state.execute_native_tool(task, tool_name, parsed["arguments"])
+                    step_summary = {
+                        "step": step + 1,
+                        "tool_name": tool_name,
+                        "target": parsed["arguments"].get("path") or parsed["arguments"].get("directory") or parsed["arguments"].get("query") or "",
+                    }
+                    tool_steps.append(step_summary)
+                    append_log(state.log_path, {
+                        "kind": "tool_call",
+                        "task_id": task["task_id"],
+                        "tool_name": tool_name,
+                        "target": step_summary["target"],
+                        "step": step + 1,
+                    })
+                    messages.append({"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False)})
+                    messages.append({
+                        "role": "user",
+                        "content": "Tool result:\n" + json.dumps({"tool_name": tool_name, "result": tool_result}, ensure_ascii=False, indent=2),
+                    })
+                raise TaskConflictError("Native tool loop exceeded max_tool_steps")
             except Exception as exc:
-                session["status"] = "failed"
-                session["updated_at"] = utc_now()
-                state.append_session_event(session, make_event(
-                    "turn.failed",
-                    step="final",
-                    message=str(exc),
-                    status="failed",
-                    data={"error_category": classify_error(exc)},
-                ))
+                state.fail_native_tool_session(task, exc)
                 raise
 
     return Handler
@@ -1934,3 +1452,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

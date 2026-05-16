@@ -29,6 +29,7 @@ print(json.dumps({
     "id": data.get("id"),
     "status": data.get("status"),
     "model": data.get("model"),
+    "model_label": data.get("model_label"),
     "output_text": data.get("output_text"),
     "contains_proxy_ok": "proxy-ok" in str(data.get("output_text")),
     "input_tokens": (data.get("usage") or {}).get("input_tokens"),

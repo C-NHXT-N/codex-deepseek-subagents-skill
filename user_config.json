@@ -1,18 +1,7 @@
-{
+﻿{
   "runtime": {
-    "port": __PORT__,
-    "log_level": "info",
-    "event_transport": "sse",
-    "retry": {
-      "max_attempts": 3,
-      "backoff_seconds": 1
-    }
-  },
-  "ui": {
-    "default_mode": "stream-cli",
-    "show_reasoning": true,
-    "show_tool_timeline": true,
-    "show_token_usage": true
+    "port": 4000,
+    "log_level": "info"
   },
   "connected_agents": [
     {
@@ -44,7 +33,6 @@
   "defaults": {
     "execution_agent": "DeepSeek Worker",
     "review_agent": "Codex Main",
-    "verbose": true,
     "tool_policy": {
       "allowed_paths": [
         "."
@@ -105,3 +93,4 @@
     }
   }
 }
+
