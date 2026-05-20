@@ -28,42 +28,36 @@ class FakeDeepSeekHandler(BaseHTTPRequestHandler):
         system_text = "\n".join(str(message.get("content") or "") for message in messages if message.get("role") == "system")
         combined_text = "\n".join(str(message.get("content") or "") for message in messages)
         if "DeepSeek native repository worker" in system_text:
-            conversation = "\n".join(str(message.get("content") or "") for message in messages if message.get("role") != "system")
-            if "src/app.py" in conversation:
-                if '"tool_name": "repo_read_file"' not in conversation and '"tool_name":"repo_read_file"' not in conversation:
-                    content = json.dumps({
-                        "type": "tool_call",
-                        "tool_name": "repo_read_file",
-                        "arguments": {"path": "src/app.py"},
-                    })
-                elif '"tool_name": "repo_apply_patch"' not in conversation and '"tool_name":"repo_apply_patch"' not in conversation:
-                    content = json.dumps({
-                        "type": "tool_call",
-                        "tool_name": "repo_apply_patch",
-                        "arguments": {
-                            "patch": "--- a/src/app.py\n+++ b/src/app.py\n@@ -1 +1 @@\n-print('hello')\n+print('install-native-e2e-ok')"
+            tool_messages = [message for message in messages if message.get("role") == "tool"]
+            if "src/app.py" in combined_text:
+                if not tool_messages:
+                    return self.write_json(self.tool_response(payload, "hidden scratchpad", [{
+                        "id": "call_read_src",
+                        "type": "function",
+                        "function": {"name": "repo_read_file", "arguments": json.dumps({"path": "src/app.py"})},
+                    }]))
+                latest_tool_text = "\n".join(str(message.get("content") or "") for message in tool_messages)
+                if "patch_applied" not in latest_tool_text:
+                    return self.write_json(self.tool_response(payload, "hidden scratchpad", [{
+                        "id": "call_patch_src",
+                        "type": "function",
+                        "function": {
+                            "name": "repo_apply_patch",
+                            "arguments": json.dumps({"patch": "--- a/src/app.py\n+++ b/src/app.py\n@@ -1 +1 @@\n-print('hello')\n+print('install-native-e2e-ok')"}),
                         },
-                    })
-                else:
-                    content = json.dumps({
-                        "type": "final",
-                        "content": "install-native-e2e-ok",
-                    })
+                    }]))
+                content = "install-native-e2e-ok"
             else:
-                if '"tool_name": "repo_read_file"' not in conversation and '"tool_name":"repo_read_file"' not in conversation:
-                    content = json.dumps({
-                        "type": "tool_call",
-                        "tool_name": "repo_read_file",
-                        "arguments": {"path": "README.md"},
-                    })
-                else:
-                    content = json.dumps({
-                        "type": "final",
-                        "content": "install-native-ok",
-                    })
+                if not tool_messages:
+                    return self.write_json(self.tool_response(payload, "hidden scratchpad", [{
+                        "id": "call_readme",
+                        "type": "function",
+                        "function": {"name": "repo_read_file", "arguments": json.dumps({"path": "README.md"})},
+                    }]))
+                content = "install-native-ok"
         else:
             content = "runtime-ok" if "runtime-ok" in combined_text else "install-smoke-ok"
-        body = {
+        self.write_json({
             "id": "chatcmpl-install-smoke",
             "model": payload["model"],
             "choices": [{
@@ -76,16 +70,42 @@ class FakeDeepSeekHandler(BaseHTTPRequestHandler):
             "usage": {
                 "prompt_tokens": 5,
                 "completion_tokens": 3,
+                "prompt_cache_hit_tokens": 4,
+                "prompt_cache_miss_tokens": 1,
                 "total_tokens": 8,
                 "completion_tokens_details": {"reasoning_tokens": 1},
             },
-        }
+        })
+
+    def write_json(self, body):
         data = json.dumps(body).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def tool_response(self, payload, reasoning, tool_calls):
+        return {
+            "id": "chatcmpl-install-smoke",
+            "model": payload["model"],
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "",
+                    "reasoning_content": reasoning,
+                    "tool_calls": tool_calls,
+                },
+            }],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 3,
+                "prompt_cache_hit_tokens": 4,
+                "prompt_cache_miss_tokens": 1,
+                "total_tokens": 8,
+                "completion_tokens_details": {"reasoning_tokens": 1},
+            },
+        }
 
 
 def free_port():
@@ -443,10 +463,31 @@ class InstalledRuntimeSmokeTests(unittest.TestCase):
                 )
                 with urllib.request.urlopen(tool_req, timeout=5) as res:
                     native_response = json.loads(res.read().decode("utf-8"))
-                self.assertEqual(native_response["status"], "completed")
+                self.assertEqual(native_response["status"], "requires_action")
                 self.assertEqual(native_response["model_label"], "deepseek-v4-pro(thinking)")
                 self.assertEqual(native_response["route"]["display_label"], "deepseek-v4-pro(thinking)")
-                self.assertEqual(native_response["output_text"], "install-native-e2e-ok")
+                patch_id = native_response["required_action"]["patch_id"]
+
+                approve_patch = urllib.request.Request(
+                    f"{base}/v1/tasks/{task['task_id']}/patches/{patch_id}/approve",
+                    data=json.dumps({"approval_note": "integration e2e"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(approve_patch, timeout=5) as res:
+                    approved_patch = json.loads(res.read().decode("utf-8"))
+                self.assertEqual("approved", approved_patch["status"])
+
+                apply_patch = urllib.request.Request(
+                    f"{base}/v1/tasks/{task['task_id']}/patches/{patch_id}/apply",
+                    data=json.dumps({}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(apply_patch, timeout=5) as res:
+                    apply_result = json.loads(res.read().decode("utf-8"))
+                self.assertEqual("completed", apply_result["status"])
+                self.assertEqual("install-native-e2e-ok", apply_result["content"])
 
                 with urllib.request.urlopen(f"{base}/v1/tasks/{task['task_id']}", timeout=5) as res:
                     fetched = json.loads(res.read().decode("utf-8"))

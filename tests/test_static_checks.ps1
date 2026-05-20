@@ -19,8 +19,11 @@ foreach ($needle in @(
     '--thinking-view',
     '--patch-view',
     '--deep',
+    'approve-patch',
+    'show-patch',
     'Invoke-RuntimeCli -RuntimeCommand "usage"',
-    'Invoke-RuntimeCli -RuntimeCommand "tui"'
+    'Invoke-RuntimeCli -RuntimeCommand "tui"',
+    'Invoke-RuntimeCli -RuntimeCommand "approve-patch"'
 )) {
     if ($scriptText -notmatch [regex]::Escape($needle)) {
         throw "PowerShell wrapper is missing expected runtime surface: $needle"
@@ -124,6 +127,9 @@ try {
     }
     if ($userConfig.defaults.execution_agent -ne "DeepSeek Worker") {
         throw "user_config.json did not contain expected execution_agent default"
+    }
+    if ($userConfig.tool_calling.mode -ne "native") {
+        throw "user_config.json did not contain expected tool_calling.mode"
     }
 
     $runtimeFiles = @(

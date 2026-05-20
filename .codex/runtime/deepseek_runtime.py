@@ -257,10 +257,10 @@ def render_events(events, verbose=True):
             lines.append(f"[DeepSeek] Output: {event.get('message')}")
             continue
         if event_type == "turn.completed":
-            lines.append("✅ All tasks completed successfully")
+            lines.append("鉁?All tasks completed successfully")
             continue
         if event_type == "turn.failed":
-            lines.append(f"⚠ {event.get('message')}")
+            lines.append(f"鈿?{event.get('message')}")
             lines.append("Press Enter to retry or Ctrl+C to abort")
             continue
     return lines

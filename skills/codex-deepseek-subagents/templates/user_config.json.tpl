@@ -44,6 +44,23 @@
       }
     }
   ],
+  "tool_calling": {
+    "mode": "native",
+    "fallback_json_protocol": true,
+    "strict": false
+  },
+  "routing": {
+    "default": "flash",
+    "analysis": "flash-thinking",
+    "execution": "pro-thinking",
+    "patch_repair": "pro-thinking",
+    "max_effort_after_tool_turns": 2
+  },
+  "privacy": {
+    "persist_raw_reasoning": false,
+    "persist_full_patch": false,
+    "persist_assistant_output": false
+  },
   "defaults": {
     "execution_agent": "DeepSeek Worker",
     "review_agent": "Codex Main",

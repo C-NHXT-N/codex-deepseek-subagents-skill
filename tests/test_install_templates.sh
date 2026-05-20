@@ -49,6 +49,8 @@ grep -q -- '--thinking-view' "$script"
 grep -q -- '--patch-view' "$script"
 grep -q 'tui()' "$script"
 grep -q 'runtime_cli tui' "$script"
+grep -q 'show_patch()' "$script"
+grep -q 'approve_patch()' "$script"
 
 cat > "$tmp/.codex/test-responses-proxy.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -77,6 +79,7 @@ data = json.load(open(sys.argv[1], encoding="utf-8"))
 assert "deepseek_api_key" not in data
 assert data["defaults"]["execution_agent"] == "DeepSeek Worker"
 assert len(data["connected_agents"]) == 2
+assert data["tool_calling"]["mode"] == "native"
 PY
 
 grep -q "127.0.0.1:5001" "$tmp/.codex/config.toml"

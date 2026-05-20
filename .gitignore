@@ -13,6 +13,7 @@ __pycache__/
 .codex/runtime/task_queue.json
 .codex/runtime/sessions.json
 .codex/runtime/events.log.jsonl
+.codex/runtime/patches/
 .codex/runtime/runtime.pid
 .codex/runtime/stdout.log
 .codex/runtime/stderr.log

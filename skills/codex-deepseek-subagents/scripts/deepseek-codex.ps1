@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("install", "update", "uninstall", "doctor", "desktop-doctor", "delegate", "analyze", "start-proxy", "stop-proxy", "test-proxy", "test-runtime", "start-runtime", "stop-runtime", "usage", "tui", "redact", "export-shareable")]
+    [ValidateSet("install", "update", "uninstall", "doctor", "desktop-doctor", "delegate", "analyze", "start-proxy", "stop-proxy", "test-proxy", "test-runtime", "start-runtime", "stop-runtime", "usage", "tui", "list-patches", "show-patch", "approve-patch", "reject-patch", "apply-patch", "redact", "export-shareable")]
     [string]$Command = "doctor",
 
     [string]$ProjectRoot = (Get-Location).Path,
@@ -28,6 +28,8 @@ param(
     [string]$Ui = "stream",
     [string]$Prompt = "",
     [string]$PromptFile = "",
+    [string]$TaskId = "",
+    [string]$PatchId = "",
     [int]$MaxTokens = 2048,
     [string]$OutFile = "",
     [switch]$Json,
@@ -855,6 +857,39 @@ function Show-Tui {
     Invoke-RuntimeCli -RuntimeCommand "tui"
 }
 
+function Show-Patches {
+    $extraArgs = @("--task-id", $TaskId)
+    if ($Json) { $extraArgs += "--json" }
+    Invoke-RuntimeCli -RuntimeCommand "list-patches" -ExtraArgs $extraArgs
+}
+
+function Show-Patch {
+    $extraArgs = @("--task-id", $TaskId, "--patch-id", $PatchId)
+    if ($Json) { $extraArgs += "--json" }
+    Invoke-RuntimeCli -RuntimeCommand "show-patch" -ExtraArgs $extraArgs
+}
+
+function Approve-Patch {
+    $extraArgs = @("--task-id", $TaskId, "--patch-id", $PatchId)
+    if ($Json) { $extraArgs += "--json" }
+    if ($Yes) { $extraArgs += "--yes" }
+    Invoke-RuntimeCli -RuntimeCommand "approve-patch" -ExtraArgs $extraArgs
+}
+
+function Reject-Patch {
+    $extraArgs = @("--task-id", $TaskId, "--patch-id", $PatchId)
+    if ($Json) { $extraArgs += "--json" }
+    if ($Yes) { $extraArgs += "--yes" }
+    Invoke-RuntimeCli -RuntimeCommand "reject-patch" -ExtraArgs $extraArgs
+}
+
+function Apply-Patch {
+    $extraArgs = @("--task-id", $TaskId, "--patch-id", $PatchId)
+    if ($Json) { $extraArgs += "--json" }
+    if ($Yes) { $extraArgs += "--yes" }
+    Invoke-RuntimeCli -RuntimeCommand "apply-patch" -ExtraArgs $extraArgs
+}
+
 function Invoke-RedactCheck {
     $root = Resolve-FullPath $ProjectRoot
     $findings = @()
@@ -938,6 +973,11 @@ if ($MyInvocation.InvocationName -ne '.') {
         "test-runtime" { Test-Runtime }
         "usage" { Show-Usage }
         "tui" { Show-Tui }
+        "list-patches" { Show-Patches }
+        "show-patch" { Show-Patch }
+        "approve-patch" { Approve-Patch }
+        "reject-patch" { Reject-Patch }
+        "apply-patch" { Apply-Patch }
         "redact" { Invoke-RedactCheck }
         "export-shareable" { Export-Shareable }
     }

@@ -115,6 +115,14 @@ class RuntimeUxTests(unittest.TestCase):
                     self.runtime.resolve_mode(argparse.Namespace(mode=None, model=None, thinking=None), root),
                 )
 
+    def test_status_card_shows_reasoning_effort(self):
+        lines = self.render.render_status_card(
+            {"model_family": "pro", "display_label": "deepseek-v4-pro(thinking)", "thinking_type": "enabled", "reasoning_effort": "high"},
+            "delegate",
+            "routing",
+        )
+        self.assertIn("Reasoning effort: high", "\n".join(lines))
+
     def test_non_tty_analyze_requires_yes_before_task_creation(self):
         args = argparse.Namespace(
             project_root=".",
@@ -144,6 +152,34 @@ class RuntimeUxTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Confirmation required but stdin is not interactive"):
                 self.runtime.command_analyze(args)
 
+    def test_non_tty_delegate_requires_yes_before_dispatch(self):
+        args = argparse.Namespace(
+            project_root=".",
+            prompt="Delegate this.",
+            prompt_file="",
+            port=0,
+            mode=None,
+            model=None,
+            thinking=None,
+            thinking_view="hidden",
+            patch_view="summary",
+            ui="stream",
+            json=False,
+            yes=False,
+            max_tokens=128,
+            max_tool_steps=4,
+            paths=None,
+            verbose=False,
+        )
+        fake_stdin = mock.Mock()
+        fake_stdin.isatty.return_value = False
+        with mock.patch.object(self.runtime, "load_project_env"), \
+             mock.patch.object(self.runtime, "build_renderer", return_value=self.render.StreamCliRenderer(io.StringIO())), \
+             mock.patch.object(self.runtime.scheduler, "build_route", return_value={"model_family": "pro", "display_label": "deepseek-v4-pro", "thinking_type": "enabled", "reasoning_effort": "high"}), \
+             mock.patch("sys.stdin", fake_stdin):
+            with self.assertRaisesRegex(RuntimeError, "Confirmation required but stdin is not interactive"):
+                self.runtime.command_delegate(args)
+
     def test_patch_preview_storage_omits_full_patch(self):
         patch = "--- a/src/app.py\n+++ b/src/app.py\n@@ -1 +1 @@\n-print('hello')\n+print('ok')\n"
         event = self.events.make_event(
@@ -172,13 +208,13 @@ class RuntimeUxTests(unittest.TestCase):
 
     def test_usage_human_output(self):
         rows = [
-            {"kind": "responses_usage", "model_label": "deepseek-v4-pro(thinking)", "prompt_tokens": 10, "completion_tokens": 5, "reasoning_tokens": 3, "total_tokens": 18},
-            {"kind": "responses_usage", "model_label": "deepseek-v4-flash", "prompt_tokens": 7, "completion_tokens": 2, "reasoning_tokens": 0, "total_tokens": 9},
+            {"kind": "responses_usage", "model_label": "deepseek-v4-pro(thinking)", "prompt_tokens": 10, "completion_tokens": 5, "reasoning_tokens": 3, "prompt_cache_hit_tokens": 6, "prompt_cache_miss_tokens": 4, "total_tokens": 18},
+            {"kind": "responses_usage", "model_label": "deepseek-v4-flash", "prompt_tokens": 7, "completion_tokens": 2, "reasoning_tokens": 0, "prompt_cache_hit_tokens": 1, "prompt_cache_miss_tokens": 3, "total_tokens": 9},
         ]
         summary = self.usage.summarize_usage(rows)
         lines = self.usage.render_usage(summary)
         text = "\n".join(lines)
         self.assertIn("Requests: 2", text)
+        self.assertIn("Cache hit tokens: 7", text)
         self.assertIn("deepseek-v4-pro(thinking)", text)
         self.assertIn("deepseek-v4-flash", text)
-

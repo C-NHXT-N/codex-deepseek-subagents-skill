@@ -91,6 +91,8 @@ The runtime provides:
 - text delegation
 - approved native repository tools for `execution` tasks
 - `stream=true` through SSE events
+- official DeepSeek `tools` / `tool_calls`
+- patch approval `requires_action` responses
 
 Shell command execution remains disabled.
 
@@ -135,6 +137,7 @@ Default `--thinking-view` is `hidden`. `summary` only shows local hidden-chars/t
 - `delegate` and `analyze` must show a route card and scope card before work is sent.
 - `analyze` is the preferred read-only path and only enables list/read/search repository tools.
 - native patch tasks must show `patch.preview` before `patch.applied`.
+- patch application must always wait for explicit approval through `list-patches`, `show-patch`, `approve-patch`, `reject-patch`, and `apply-patch`.
 - `tui` opens a runtime dashboard only and must not send a DeepSeek request by itself.
 - if TUI is unavailable in the current terminal, the runtime must print a fallback message and continue with `stream-cli`.
 

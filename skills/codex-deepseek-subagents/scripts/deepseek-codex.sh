@@ -27,6 +27,8 @@ PATCH_VIEW="summary"
 UI="stream"
 PROMPT=""
 PROMPT_FILE=""
+TASK_ID=""
+PATCH_ID=""
 MAX_TOKENS="2048"
 JSON=0
 YES=0
@@ -44,6 +46,7 @@ Usage: deepseek-codex.sh <command> [options]
 Commands:
   install, update, uninstall, doctor, delegate, analyze,
   start-runtime, stop-runtime, test-runtime, tui,
+  list-patches, show-patch, approve-patch, reject-patch, apply-patch,
   usage, redact, export-shareable
 
 Compatibility aliases:
@@ -65,6 +68,8 @@ Options:
   --ui stream|tui
   --prompt TEXT
   --prompt-file PATH
+  --task-id ID
+  --patch-id ID
   --json
   --yes
   --deep
@@ -101,6 +106,8 @@ while [[ $# -gt 0 ]]; do
     --ui) UI="$2"; shift 2 ;;
     --prompt|-Prompt) PROMPT="$2"; shift 2 ;;
     --prompt-file|-PromptFile) PROMPT_FILE="$2"; shift 2 ;;
+    --task-id|-TaskId) TASK_ID="$2"; shift 2 ;;
+    --patch-id|-PatchId) PATCH_ID="$2"; shift 2 ;;
     --json) JSON=1; shift ;;
     --yes) YES=1; shift ;;
     --deep) DEEP=1; shift ;;
@@ -676,6 +683,39 @@ tui() {
   runtime_cli tui
 }
 
+list_patches() {
+  local args=(list-patches --task-id "$TASK_ID")
+  [[ "$JSON" == "1" ]] && args+=(--json)
+  runtime_cli "${args[@]}"
+}
+
+show_patch() {
+  local args=(show-patch --task-id "$TASK_ID" --patch-id "$PATCH_ID")
+  [[ "$JSON" == "1" ]] && args+=(--json)
+  runtime_cli "${args[@]}"
+}
+
+approve_patch() {
+  local args=(approve-patch --task-id "$TASK_ID" --patch-id "$PATCH_ID")
+  [[ "$JSON" == "1" ]] && args+=(--json)
+  [[ "$YES" == "1" ]] && args+=(--yes)
+  runtime_cli "${args[@]}"
+}
+
+reject_patch() {
+  local args=(reject-patch --task-id "$TASK_ID" --patch-id "$PATCH_ID")
+  [[ "$JSON" == "1" ]] && args+=(--json)
+  [[ "$YES" == "1" ]] && args+=(--yes)
+  runtime_cli "${args[@]}"
+}
+
+apply_patch_cmd() {
+  local args=(apply-patch --task-id "$TASK_ID" --patch-id "$PATCH_ID")
+  [[ "$JSON" == "1" ]] && args+=(--json)
+  [[ "$YES" == "1" ]] && args+=(--yes)
+  runtime_cli "${args[@]}"
+}
+
 redact_check() {
   if grep -RInE 'sk-[A-Za-z0-9]{12,}' "$PROJECT_ROOT" --exclude='*.local.*' --exclude='events.log.jsonl' --exclude-dir='.git' --exclude-dir='backups' >/tmp/codex-deepseek-redact.txt; then
     cat /tmp/codex-deepseek-redact.txt
@@ -709,6 +749,11 @@ case "$COMMAND" in
   test-runtime) test_runtime ;;
   usage) show_usage ;;
   tui) tui ;;
+  list-patches) list_patches ;;
+  show-patch) show_patch ;;
+  approve-patch) approve_patch ;;
+  reject-patch) reject_patch ;;
+  apply-patch) apply_patch_cmd ;;
   redact) redact_check ;;
   export-shareable) export_shareable ;;
   *) echo "Unknown command: $COMMAND" >&2; usage; exit 2 ;;

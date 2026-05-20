@@ -91,6 +91,8 @@ The local runtime is a single Python service that provides:
 - text delegation
 - approved native repository tools bound to `metadata.scheduler_task_id`
 - `stream=true` via SSE event streaming
+- official DeepSeek `tools` / `tool_calls`
+- `requires_action` patch approval responses
 
 Shell command execution remains disabled.
 
@@ -108,6 +110,11 @@ Primary commands:
 - `analyze`
 - `tui`
 - `usage`
+- `list-patches`
+- `show-patch`
+- `approve-patch`
+- `reject-patch`
+- `apply-patch`
 
 Maintenance commands still available:
 
@@ -136,6 +143,8 @@ Default interaction uses `stream-cli`. Each `delegate` or `analyze` session show
 - scope card: summary, read/write paths, allowed tools, DeepSeek endpoint
 - live timeline: route selection, approval, reasoning state, tool calls, patch preview, completion
 - usage summary at the end
+
+Patch application is never automatic. `repo_apply_patch` creates a pending patch and returns `requires_action`; the patch only applies after explicit approval.
 
 Useful runtime flags:
 

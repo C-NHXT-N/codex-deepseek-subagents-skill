@@ -1,7 +1,12 @@
-﻿{
+{
   "runtime": {
     "port": 4000,
-    "log_level": "info"
+    "log_level": "info",
+    "event_transport": "sse",
+    "retry": {
+      "max_attempts": 3,
+      "backoff_seconds": 1
+    }
   },
   "connected_agents": [
     {
@@ -33,7 +38,15 @@
   "defaults": {
     "execution_agent": "DeepSeek Worker",
     "review_agent": "Codex Main",
+    "verbose": true,
     "tool_policy": {
+      "allowed_tools": [
+        "repo_list_files",
+        "repo_read_file",
+        "repo_search_text",
+        "repo_apply_patch",
+        "repo_write_file"
+      ],
       "allowed_paths": [
         "."
       ],
@@ -78,19 +91,34 @@
         ".rs",
         ".java"
       ],
-      "allowed_tools": [
-        "repo_list_files",
-        "repo_read_file",
-        "repo_search_text",
-        "repo_apply_patch",
-        "repo_write_file"
-      ],
       "max_file_read_bytes": 262144,
       "max_search_results": 50,
       "max_tool_steps": 12,
       "allow_full_rewrite": false,
       "allow_delete": false
     }
+  },
+  "ui": {
+    "default_mode": "stream-cli",
+    "show_reasoning": true,
+    "show_tool_timeline": true,
+    "show_token_usage": true
+  },
+  "tool_calling": {
+    "mode": "native",
+    "fallback_json_protocol": true,
+    "strict": false
+  },
+  "routing": {
+    "default": "flash",
+    "analysis": "flash-thinking",
+    "execution": "pro-thinking",
+    "patch_repair": "pro-thinking",
+    "max_effort_after_tool_turns": 2
+  },
+  "privacy": {
+    "persist_raw_reasoning": false,
+    "persist_full_patch": false,
+    "persist_assistant_output": false
   }
 }
-

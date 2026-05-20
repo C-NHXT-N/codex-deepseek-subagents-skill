@@ -30,6 +30,9 @@ class FakeDeepSeekHandler(BaseHTTPRequestHandler):
         messages = payload.get("messages") or []
         system_text = "\n".join(str(message.get("content") or "") for message in messages if message.get("role") == "system")
         body = self.build_body(payload, system_text, messages)
+        if payload.get("stream"):
+            self.send_stream(body, payload)
+            return
         data = json.dumps(body).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -37,32 +40,90 @@ class FakeDeepSeekHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_stream(self, body, payload):
+        choice = body["choices"][0]
+        message = choice["message"]
+        usage = body.get("usage") or {}
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+
+        def write_event(data):
+            chunk = f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+            self.wfile.write(chunk)
+            self.wfile.flush()
+
+        delta = {}
+        if message.get("reasoning_content"):
+            delta["reasoning_content"] = message["reasoning_content"]
+        if message.get("content"):
+            delta["content"] = message["content"]
+        if message.get("tool_calls"):
+            delta["tool_calls"] = []
+            for index, tool_call in enumerate(message["tool_calls"]):
+                delta["tool_calls"].append({
+                    "index": index,
+                    "id": tool_call.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": tool_call.get("function", {}).get("name", ""),
+                        "arguments": tool_call.get("function", {}).get("arguments", ""),
+                    },
+                })
+        write_event({
+            "id": body["id"],
+            "model": body["model"],
+            "choices": [{"delta": delta, "finish_reason": None}],
+        })
+        write_event({
+            "id": body["id"],
+            "model": body["model"],
+            "choices": [{"delta": {}, "finish_reason": choice.get("finish_reason")}],
+            "usage": usage,
+        })
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
     def build_body(self, payload, system_text, messages):
         if "DeepSeek native repository worker" not in system_text:
             return self.text_response(payload, "worker-ok", "internal reasoning that must not be logged", 11, 7, 18, 3)
 
-        combined = "\n".join(str(message.get("content") or "") for message in messages)
-        if '"tool_name": "repo_read_file"' not in combined and '"tool_name":"repo_read_file"' not in combined:
-            content = json.dumps({
-                "type": "tool_call",
-                "tool_name": "repo_read_file",
-                "arguments": {"path": "src/app.py"},
-            })
-            return self.text_response(payload, content, "native step 1", 13, 5, 18, 2)
-        if '"tool_name": "repo_apply_patch"' not in combined and '"tool_name":"repo_apply_patch"' not in combined:
-            content = json.dumps({
-                "type": "tool_call",
-                "tool_name": "repo_apply_patch",
-                "arguments": {
-                    "patch": "--- a/src/app.py\n+++ b/src/app.py\n@@ -1 +1 @@\n-print('hello')\n+print('native-ok')"
-                },
-            })
-            return self.text_response(payload, content, "native step 2", 14, 6, 20, 2)
-        content = json.dumps({
-            "type": "final",
-            "content": "native-tools-ok",
-        })
-        return self.text_response(payload, content, "native done", 9, 4, 13, 1)
+        tool_messages = [message for message in messages if message.get("role") == "tool"]
+        if not tool_messages:
+            return self.tool_response(
+                payload,
+                "native step 1",
+                [{
+                    "id": "call_read_file",
+                    "type": "function",
+                    "function": {"name": "repo_read_file", "arguments": json.dumps({"path": "src/app.py"})},
+                }],
+                13,
+                5,
+                18,
+                2,
+            )
+        latest_tool_text = "\n".join(str(message.get("content") or "") for message in tool_messages)
+        if "patch_applied" not in latest_tool_text:
+            return self.tool_response(
+                payload,
+                "native step 2",
+                [{
+                    "id": "call_apply_patch",
+                    "type": "function",
+                    "function": {
+                        "name": "repo_apply_patch",
+                        "arguments": json.dumps({
+                            "patch": "--- a/src/app.py\n+++ b/src/app.py\n@@ -1 +1 @@\n-print('hello')\n+print('native-ok')"
+                        }),
+                    },
+                }],
+                14,
+                6,
+                20,
+                2,
+            )
+        return self.text_response(payload, "native-tools-ok", "native done", 9, 4, 13, 1)
 
     def text_response(self, payload, content, reasoning, prompt_tokens, completion_tokens, total_tokens, reasoning_tokens):
         return {
@@ -78,6 +139,32 @@ class FakeDeepSeekHandler(BaseHTTPRequestHandler):
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "prompt_cache_hit_tokens": 2,
+                "prompt_cache_miss_tokens": 5,
+                "total_tokens": total_tokens,
+                "completion_tokens_details": {
+                    "reasoning_tokens": reasoning_tokens,
+                },
+            },
+        }
+
+    def tool_response(self, payload, reasoning, tool_calls, prompt_tokens, completion_tokens, total_tokens, reasoning_tokens):
+        return {
+            "id": "chatcmpl-test",
+            "model": payload["model"],
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "",
+                    "reasoning_content": reasoning,
+                    "tool_calls": tool_calls,
+                },
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "prompt_cache_hit_tokens": 3,
+                "prompt_cache_miss_tokens": 7,
                 "total_tokens": total_tokens,
                 "completion_tokens_details": {
                     "reasoning_tokens": reasoning_tokens,
@@ -250,7 +337,7 @@ class SchedulerRuntimeTests(unittest.TestCase):
             "description": "Task that will fail",
             "approval_scope": {"summary": "approved failure test"},
         })
-        original = SCHEDULER.invoke_deepseek_messages
+        original = SCHEDULER.invoke_deepseek_chat_completion
         snapshots = []
         original_save = state.save_task_store
 
@@ -258,15 +345,15 @@ class SchedulerRuntimeTests(unittest.TestCase):
             original_save()
             snapshots.append(json.loads(self.task_store_path.read_text(encoding="utf-8")))
 
-        def fail_chat(messages, mode, max_tokens, retry=None):
+        def fail_chat(messages, mode, max_tokens, retry=None, **kwargs):
             raise RuntimeError("planned failure")
 
         try:
             state.save_task_store = capture_save
-            SCHEDULER.invoke_deepseek_messages = fail_chat
+            SCHEDULER.invoke_deepseek_chat_completion = fail_chat
             approved = state.approve_task(task["task_id"], {"approval_token": "approved-by-user"})
         finally:
-            SCHEDULER.invoke_deepseek_messages = original
+            SCHEDULER.invoke_deepseek_chat_completion = original
 
         self.assertEqual(approved["status"], "failed")
         statuses = [snapshot["tasks"][0]["status"] for snapshot in snapshots]
@@ -369,10 +456,38 @@ class SchedulerRuntimeTests(unittest.TestCase):
             )
             with urllib.request.urlopen(tool_req, timeout=5) as res:
                 tool_response = json.loads(res.read().decode("utf-8"))
-            self.assertEqual(tool_response["status"], "completed")
+            self.assertEqual(tool_response["status"], "requires_action")
             self.assertEqual(tool_response["model_label"], "deepseek-v4-pro(thinking)")
             self.assertEqual(tool_response["route"]["display_label"], "deepseek-v4-pro(thinking)")
-            self.assertEqual(tool_response["output_text"], "native-tools-ok")
+            self.assertEqual(tool_response["required_action"]["type"], "patch_approval")
+            patch_id = tool_response["required_action"]["patch_id"]
+            self.assertEqual((self.root / "src" / "app.py").read_text(encoding="utf-8"), "print('hello')\n")
+
+            with urllib.request.urlopen(f"{base}/v1/tasks/{created_task['task_id']}/patches", timeout=5) as res:
+                patches = json.loads(res.read().decode("utf-8"))
+            self.assertEqual(1, len(patches["data"]))
+            self.assertEqual(patch_id, patches["data"][0]["patch_id"])
+
+            approve_patch_req = urllib.request.Request(
+                f"{base}/v1/tasks/{created_task['task_id']}/patches/{patch_id}/approve",
+                data=json.dumps({"approval_note": "ok"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(approve_patch_req, timeout=5) as res:
+                approved_patch = json.loads(res.read().decode("utf-8"))
+            self.assertEqual("approved", approved_patch["status"])
+
+            apply_patch_req = urllib.request.Request(
+                f"{base}/v1/tasks/{created_task['task_id']}/patches/{patch_id}/apply",
+                data=json.dumps({}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(apply_patch_req, timeout=5) as res:
+                apply_result = json.loads(res.read().decode("utf-8"))
+            self.assertEqual("completed", apply_result["status"])
+            self.assertEqual("native-tools-ok", apply_result["content"])
             self.assertEqual((self.root / "src" / "app.py").read_text(encoding="utf-8"), "print('native-ok')\n")
 
             with urllib.request.urlopen(f"{base}/v1/tasks/{created_task['task_id']}", timeout=5) as res:
@@ -514,6 +629,146 @@ class SchedulerRuntimeTests(unittest.TestCase):
             runtime_server.shutdown()
             runtime_server.server_close()
             runtime_thread.join(timeout=2)
+
+    def test_native_tool_turn_recovers_from_missing_path_error(self):
+        state = self.build_state()
+        task = state.create_task({
+            "type": "execution",
+            "description": "Recover from missing path",
+            "tool_policy": {
+                "allowed_paths": [".", "src", "README.md"],
+                "allowed_tools": ["repo_list_files", "repo_read_file"],
+                "read_extensions": [".py", ".md"],
+                "write_extensions": [".py"],
+                "max_tool_steps": 4,
+            },
+            "approval_scope": {
+                "summary": "recover after bad path",
+                "files": [".", "README.md"],
+                "exploration": "listed paths only",
+            },
+        })
+        approved = state.approve_task(task["task_id"], {"approval_token": "approved-by-user"})
+        (self.root / "README.md").write_text("hello\n", encoding="utf-8")
+
+        calls = {"count": 0}
+        original_invoke = SCHEDULER.invoke_deepseek_chat_completion
+        original_stream = SCHEDULER.stream_deepseek_chat_completion
+        events = []
+
+        def fake_invoke(messages, mode, max_tokens, retry=None, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                content = json.dumps({"type": "tool_call", "tool_name": "repo_list_files", "arguments": {"directory": "codex"}})
+            elif calls["count"] == 2:
+                content = json.dumps({"type": "tool_call", "tool_name": "repo_read_file", "arguments": {"path": "README.md"}})
+            else:
+                content = json.dumps({"type": "final", "content": "recovered-ok"})
+            return {
+                "model": "deepseek-v4-pro",
+                "model_label": "deepseek-v4-pro(thinking)",
+                "content": content,
+                "tool_calls": [],
+                "reasoning_content": "",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "prompt_cache_hit_tokens": 0,
+                "prompt_cache_miss_tokens": 0,
+                "total_tokens": 2,
+                "reasoning_tokens": 0,
+            }
+
+        try:
+            SCHEDULER.invoke_deepseek_chat_completion = fake_invoke
+            SCHEDULER.stream_deepseek_chat_completion = lambda **kwargs: iter(())
+            result = SCHEDULER.run_native_tool_turn(
+                state,
+                approved,
+                ["repo_list_files", "repo_read_file"],
+                [{"role": "user", "content": "Recover from a missing directory path and continue."}],
+                128,
+                "pro-thinking",
+                event_sink=events.append,
+            )
+        finally:
+            SCHEDULER.invoke_deepseek_chat_completion = original_invoke
+            SCHEDULER.stream_deepseek_chat_completion = original_stream
+
+        self.assertEqual("recovered-ok", result["content"])
+        completed = [event for event in events if event["type"] == "tool.call.completed"]
+        self.assertTrue(any(
+            isinstance((event.get("data") or {}).get("result"), dict)
+            and ((event.get("data") or {}).get("result") or {}).get("recoverable") is True
+            for event in completed
+        ))
+        self.assertEqual("response.completed", events[-1]["type"])
+
+    def test_native_tool_turn_rejects_fake_final_after_protocol_retries(self):
+        state = self.build_state()
+        task = state.create_task({
+            "type": "execution",
+            "description": "Reject fake final",
+            "tool_policy": {
+                "allowed_paths": ["."],
+                "allowed_tools": ["repo_read_file"],
+                "read_extensions": [".py", ".md", ".json", ".sh", ".ps1", ".toml"],
+                "write_extensions": [".py"],
+                "max_tool_steps": 4,
+            },
+            "approval_scope": {
+                "summary": "reject fake final",
+                "files": ["."],
+                "exploration": "listed paths only",
+            },
+        })
+        approved = state.approve_task(task["task_id"], {"approval_token": "approved-by-user"})
+
+        raw_fake_final = (
+            '{"type": "tool_call", "tool_name": "repo_read_file", "arguments": {"path": "tests/test_install_runtime_smoke.py"}}\n'
+            '{"type": "tool_call", "tool_name": "repo_read_file", "arguments": {"path": "tests/test_runtime_ux.py"}}'
+        )
+        calls = {"count": 0}
+        original_invoke = SCHEDULER.invoke_deepseek_chat_completion
+        original_stream = SCHEDULER.stream_deepseek_chat_completion
+        events = []
+
+        def fake_invoke(messages, mode, max_tokens, retry=None, **kwargs):
+            calls["count"] += 1
+            return {
+                "model": "deepseek-v4-pro",
+                "model_label": "deepseek-v4-pro(thinking)",
+                "content": raw_fake_final,
+                "tool_calls": [],
+                "reasoning_content": "",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "prompt_cache_hit_tokens": 0,
+                "prompt_cache_miss_tokens": 0,
+                "total_tokens": 2,
+                "reasoning_tokens": 0,
+            }
+
+        try:
+            SCHEDULER.invoke_deepseek_chat_completion = fake_invoke
+            SCHEDULER.stream_deepseek_chat_completion = lambda **kwargs: iter(())
+            with self.assertRaisesRegex(SCHEDULER.TaskConflictError, "valid final response"):
+                SCHEDULER.run_native_tool_turn(
+                    state,
+                    approved,
+                    ["repo_read_file"],
+                    [{"role": "user", "content": "Return a real final answer only."}],
+                    128,
+                    "pro-thinking",
+                    event_sink=events.append,
+                )
+        finally:
+            SCHEDULER.invoke_deepseek_chat_completion = original_invoke
+            SCHEDULER.stream_deepseek_chat_completion = original_stream
+
+        self.assertEqual(1, len([event for event in events if event["type"] == "tool.protocol.error"]))
+        self.assertEqual("turn.failed", events[-1]["type"])
+        self.assertFalse(any(event["type"] == "assistant.delta" for event in events))
+        self.assertFalse(any(event["type"] == "turn.completed" for event in events))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
-﻿# Managed by codex-deepseek-subagents
+# Managed by codex-deepseek-subagents
 import argparse
 import copy
+import hashlib
 import json
 import os
 import re
@@ -12,10 +13,37 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
 
+RUNTIME_DIR = Path(__file__).resolve().parent
+if str(RUNTIME_DIR) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_DIR))
+
+from deepseek_client import (
+    invoke_deepseek_chat_completion as client_invoke_deepseek_chat_completion,
+    invoke_deepseek_messages as client_invoke_deepseek_messages,
+    stream_deepseek_chat_completion as client_stream_deepseek_chat_completion,
+)
+from events import (
+    append_log,
+    emit_event,
+    make_event,
+    sanitize_event_for_storage,
+    utc_now,
+    write_sse_event,
+    write_sse_headers,
+)
+from patch_preview import summarize_patch
+from tool_protocol import (
+    is_invalid_final_response,
+    looks_like_failed_tool_protocol,
+    parse_tool_loop_response,
+    repair_message,
+)
+
 
 TASK_TYPES = {"analysis", "execution", "review"}
 AGENT_KINDS = {"codex_main", "deepseek_worker"}
 DEFAULT_TASK_STORE = {"tasks": []}
+DEFAULT_SESSION_STORE = {"sessions": []}
 SUPPORTED_NATIVE_TOOLS = (
     "repo_list_files",
     "repo_read_file",
@@ -24,6 +52,7 @@ SUPPORTED_NATIVE_TOOLS = (
     "repo_write_file",
     "repo_delete_file",
 )
+SUPPORTED_MODES = ("pro-thinking", "flash-thinking", "pro", "flash")
 DEFAULT_ALLOWED_TOOLS = [
     "repo_list_files",
     "repo_read_file",
@@ -73,10 +102,13 @@ DEFAULT_WRITE_EXTENSIONS = [
     ".java",
 ]
 DEFAULT_MAX_TOOL_STEPS = 12
+DEFAULT_CONTINUATION_TTL_SECONDS = 1800
+MAX_CONTINUATION_LIFETIME_SECONDS = 7200
 try:
     DEFAULT_PORT = int("4000")
 except ValueError:
     DEFAULT_PORT = 4000
+DISABLED_THINKING_VALUES = {"disabled", "none", "low-cost", "off", "false", "0"}
 
 
 class PolicyError(RuntimeError):
@@ -87,10 +119,6 @@ class TaskConflictError(RuntimeError):
     pass
 
 
-def utc_now():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
 def write_json(handler, status, obj):
     data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
@@ -98,14 +126,6 @@ def write_json(handler, status, obj):
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
     handler.wfile.write(data)
-
-
-def append_log(log_path, entry):
-    path = Path(log_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"ts": utc_now(), **entry}
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
 def response_input_to_messages(response_input):
@@ -293,6 +313,21 @@ def validate_user_config(config):
         raise ValueError("runtime.port must be an integer")
     if not isinstance(runtime["log_level"], str):
         raise ValueError("runtime.log_level must be a string")
+    runtime.setdefault("event_transport", "sse")
+    retry = runtime.get("retry") or {}
+    if not isinstance(retry, dict):
+        raise ValueError("runtime.retry must be an object")
+    retry.setdefault("max_attempts", 3)
+    retry.setdefault("backoff_seconds", 1)
+    runtime["retry"] = retry
+
+    ui = config.get("ui") or {}
+    if not isinstance(ui, dict):
+        raise ValueError("ui must be an object")
+    ui.setdefault("default_mode", "stream-cli")
+    ui.setdefault("show_reasoning", True)
+    ui.setdefault("show_tool_timeline", True)
+    ui.setdefault("show_token_usage", True)
 
     connected_agents = config.get("connected_agents")
     if not isinstance(connected_agents, list) or not connected_agents:
@@ -337,6 +372,7 @@ def validate_user_config(config):
         "review_agent",
         next((agent["name"] for agent in normalized_agents if agent["kind"] == "codex_main"), "Codex Main"),
     )
+    defaults.setdefault("verbose", True)
     defaults["tool_policy"] = normalize_tool_policy(defaults.get("tool_policy") or {
         "allowed_tools": defaults.get("default_allowed_tools") or DEFAULT_ALLOWED_TOOLS,
         "allowed_paths": defaults.get("allowed_paths") or [],
@@ -347,12 +383,100 @@ def validate_user_config(config):
         "max_tool_steps": defaults.get("max_tool_steps") or DEFAULT_MAX_TOOL_STEPS,
     })
 
+    tool_calling = config.get("tool_calling") or {}
+    if not isinstance(tool_calling, dict):
+        raise ValueError("tool_calling must be an object")
+    tool_calling.setdefault("mode", "native")
+    tool_calling.setdefault("fallback_json_protocol", True)
+    tool_calling.setdefault("strict", False)
+
+    routing = config.get("routing") or {}
+    if not isinstance(routing, dict):
+        raise ValueError("routing must be an object")
+    routing.setdefault("default", "flash")
+    routing.setdefault("analysis", "flash-thinking")
+    routing.setdefault("execution", "pro-thinking")
+    routing.setdefault("patch_repair", "pro-thinking")
+    routing.setdefault("max_effort_after_tool_turns", 2)
+
+    privacy = config.get("privacy") or {}
+    if not isinstance(privacy, dict):
+        raise ValueError("privacy must be an object")
+    privacy.setdefault("persist_raw_reasoning", False)
+    privacy.setdefault("persist_full_patch", False)
+    privacy.setdefault("persist_assistant_output", False)
+
     normalized = {
         "runtime": runtime,
         "connected_agents": normalized_agents,
         "defaults": defaults,
+        "ui": ui,
+        "tool_calling": tool_calling,
+        "routing": routing,
+        "privacy": privacy,
     }
     return normalized
+
+
+def normalize_user_config_for_write(existing_config, template_config):
+    template = copy.deepcopy(template_config if isinstance(template_config, dict) else {})
+    existing = copy.deepcopy(existing_config if isinstance(existing_config, dict) else {})
+
+    merged = {
+        "runtime": copy.deepcopy(template.get("runtime") or {}),
+        "ui": copy.deepcopy(template.get("ui") or {}),
+        "connected_agents": copy.deepcopy(template.get("connected_agents") or []),
+        "defaults": copy.deepcopy(template.get("defaults") or {}),
+        "tool_calling": copy.deepcopy(template.get("tool_calling") or {}),
+        "routing": copy.deepcopy(template.get("routing") or {}),
+        "privacy": copy.deepcopy(template.get("privacy") or {}),
+    }
+
+    runtime = existing.get("runtime")
+    if isinstance(runtime, dict):
+        merged["runtime"].update(runtime)
+        existing_retry = runtime.get("retry")
+        if isinstance(existing_retry, dict):
+            merged["runtime"].setdefault("retry", {})
+            merged["runtime"]["retry"].update(existing_retry)
+
+    ui = existing.get("ui")
+    if isinstance(ui, dict):
+        merged["ui"].update(ui)
+
+    connected_agents = existing.get("connected_agents")
+    if isinstance(connected_agents, list) and connected_agents:
+        merged["connected_agents"] = connected_agents
+
+    defaults = existing.get("defaults")
+    if isinstance(defaults, dict):
+        for key in ("execution_agent", "review_agent", "verbose"):
+            if key in defaults:
+                merged["defaults"][key] = defaults[key]
+        merged["defaults"].setdefault("tool_policy", {})
+        existing_policy = defaults.get("tool_policy")
+        if isinstance(existing_policy, dict):
+            merged["defaults"]["tool_policy"].update(existing_policy)
+        for legacy_key, policy_key in (
+            ("allowed_paths", "allowed_paths"),
+            ("read_extensions", "read_extensions"),
+            ("write_extensions", "write_extensions"),
+            ("default_allowed_tools", "allowed_tools"),
+            ("max_file_read_bytes", "max_file_read_bytes"),
+            ("max_search_results", "max_search_results"),
+            ("max_tool_steps", "max_tool_steps"),
+            ("allow_full_rewrite", "allow_full_rewrite"),
+            ("allow_delete", "allow_delete"),
+        ):
+            if legacy_key in defaults:
+                merged["defaults"]["tool_policy"][policy_key] = defaults[legacy_key]
+
+    for section in ("tool_calling", "routing", "privacy"):
+        payload = existing.get(section)
+        if isinstance(payload, dict):
+            merged[section].update(payload)
+
+    return validate_user_config(merged)
 
 
 def build_agent_index(config):
@@ -378,15 +502,20 @@ def initial_status_for_agent(agent):
 
 def runtime_capabilities():
     return {
+        "runtime_ready": True,
         "text_delegate_ready": True,
         "native_tool_agent_ready": True,
         "responses_smoke_test": True,
         "responses_tool_calling": True,
         "supported_tools": list(SUPPORTED_NATIVE_TOOLS),
-        "stream_supported": False,
+        "stream_supported": True,
         "shell_supported": False,
-        "unsupported_responses_features": ["stream=true"],
+        "unsupported_responses_features": [],
         "native_tool_agent_note": "Execution tasks can run approved local repository tools through the scheduler. Shell command execution is intentionally disabled in v1.",
+        "interactive_cli_ready": True,
+        "reasoning_stream_ready": True,
+        "route_display_ready": True,
+        "windows_wrapper_ready": True,
     }
 
 
@@ -450,43 +579,127 @@ def mode_to_model_spec(selected_mode):
     }
 
 
-def invoke_deepseek_messages(messages, mode, max_tokens):
-    if not os.environ.get("DEEPSEEK_API_KEY"):
-        raise RuntimeError("DEEPSEEK_API_KEY is not set.")
-    spec = mode_to_model_spec(mode)
-    model = spec["model"]
+def mode_family(selected_mode):
+    return "flash" if str(selected_mode or "").startswith("flash") else "pro"
+
+
+def thinking_enabled_for_mode(selected_mode):
+    return str(selected_mode or "").endswith("thinking")
+
+
+def select_mode(requested_mode=None, requested_model=None, effort=None, default_mode="pro-thinking"):
+    mode = str(requested_mode or "").strip()
+    if mode in SUPPORTED_MODES:
+        return mode
+
+    default_mode = default_mode if default_mode in SUPPORTED_MODES else "pro-thinking"
+    base = mode_family(default_mode)
+    if requested_model:
+        fast_model = os.environ.get("DEEPSEEK_OPENAI_FAST_MODEL") or ""
+        requested_model_text = str(requested_model)
+        if requested_model_text == fast_model or "flash" in requested_model_text.lower():
+            base = "flash"
+        else:
+            base = "pro"
+
+    if effort is None or str(effort).strip() == "":
+        enabled = thinking_enabled_for_mode(default_mode)
+    else:
+        enabled = str(effort).strip().lower() not in DISABLED_THINKING_VALUES
+    return f"{base}-thinking" if enabled else base
+
+
+def build_route(selected_mode, resolved_model=None):
+    spec = mode_to_model_spec(selected_mode)
+    model = resolved_model or spec["model"]
     thinking = spec["thinking"]
-    model_label = f"{model}(thinking)" if thinking["type"] == "enabled" else model
-    body = {
-        "model": model,
-        "messages": messages,
-        "thinking": thinking,
-        "max_tokens": max_tokens,
-        "stream": False,
-    }
-    base_url = os.environ.get("DEEPSEEK_OPENAI_BASE_URL", "https://api.deepseek.com").rstrip("/")
-    req = urllib.request.Request(
-        f"{base_url}/chat/completions",
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"Authorization": f"Bearer {os.environ['DEEPSEEK_API_KEY']}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=300) as upstream:
-        data = json.loads(upstream.read().decode("utf-8"))
-    message = data["choices"][0]["message"]
-    usage = data.get("usage") or {}
-    details = usage.get("completion_tokens_details") or {}
+    display_label = f"{model}(thinking)" if thinking["type"] == "enabled" else model
     return {
-        "content": message.get("content"),
-        "reasoning_content": message.get("reasoning_content"),
-        "model": data.get("model"),
-        "model_label": model_label,
-        "finish_reason": data["choices"][0].get("finish_reason"),
-        "prompt_tokens": usage.get("prompt_tokens"),
-        "completion_tokens": usage.get("completion_tokens"),
-        "reasoning_tokens": details.get("reasoning_tokens"),
-        "total_tokens": usage.get("total_tokens"),
+        "requested_mode": selected_mode,
+        "resolved_model": model,
+        "thinking_type": thinking["type"],
+        "reasoning_effort": thinking.get("reasoning_effort"),
+        "display_label": display_label,
+        "model_family": mode_family(selected_mode),
     }
+
+
+def usage_from_result(result):
+    hit = int(result.get("prompt_cache_hit_tokens") or 0)
+    miss = int(result.get("prompt_cache_miss_tokens") or 0)
+    total_cache = hit + miss
+    return {
+        "input_tokens": result.get("prompt_tokens"),
+        "output_tokens": result.get("completion_tokens"),
+        "total_tokens": result.get("total_tokens"),
+        "reasoning_tokens": result.get("reasoning_tokens"),
+        "prompt_cache_hit_tokens": result.get("prompt_cache_hit_tokens"),
+        "prompt_cache_miss_tokens": result.get("prompt_cache_miss_tokens"),
+        "cache_hit_ratio": (float(hit) / float(total_cache)) if total_cache else None,
+    }
+
+
+def invoke_deepseek_messages(messages, mode, max_tokens, retry=None):
+    spec = mode_to_model_spec(mode)
+    return client_invoke_deepseek_messages(messages, spec["model"], spec["thinking"], max_tokens, retry=retry)
+
+
+def invoke_deepseek_chat_completion(
+    messages,
+    mode,
+    max_tokens,
+    retry=None,
+    tools=None,
+    tool_choice=None,
+    response_format=None,
+    stream=False,
+    stream_options=None,
+    user_id=None,
+    base_url=None,
+):
+    spec = mode_to_model_spec(mode)
+    return client_invoke_deepseek_chat_completion(
+        messages=messages,
+        model=spec["model"],
+        thinking=spec["thinking"],
+        max_tokens=max_tokens,
+        retry=retry,
+        tools=tools,
+        tool_choice=tool_choice,
+        response_format=response_format,
+        stream=stream,
+        stream_options=stream_options,
+        user_id=user_id,
+        base_url=base_url,
+    )
+
+
+def stream_deepseek_chat_completion(
+    messages,
+    mode,
+    max_tokens,
+    retry=None,
+    tools=None,
+    tool_choice=None,
+    response_format=None,
+    stream_options=None,
+    user_id=None,
+    base_url=None,
+):
+    spec = mode_to_model_spec(mode)
+    return client_stream_deepseek_chat_completion(
+        messages=messages,
+        model=spec["model"],
+        thinking=spec["thinking"],
+        max_tokens=max_tokens,
+        retry=retry,
+        tools=tools,
+        tool_choice=tool_choice,
+        response_format=response_format,
+        stream_options=stream_options,
+        user_id=user_id,
+        base_url=base_url,
+    )
 
 
 def invoke_deepseek_chat(task, mode):
@@ -497,44 +710,802 @@ def invoke_deepseek_chat(task, mode):
     )
 
 
-def parse_jsonish_object(content):
-    text = str(content or "").strip()
-    if not text:
-        return None
-    if text.startswith("```"):
-        match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
-        if match:
-            text = match.group(1).strip()
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def parse_tool_loop_response(content):
-    parsed = parse_jsonish_object(content)
-    if not parsed:
-        return {"type": "final", "content": str(content or "").strip()}
-    response_type = str(parsed.get("type") or "").strip()
-    if response_type == "final":
-        return {"type": "final", "content": str(parsed.get("content") or "")}
-    if response_type == "tool_call":
-        tool_name = str(parsed.get("tool_name") or parsed.get("name") or "").strip()
-        arguments = parsed.get("arguments")
-        if not isinstance(arguments, dict):
-            raise ValueError("tool_call.arguments must be an object")
-        return {"type": "tool_call", "tool_name": tool_name, "arguments": arguments}
-    if parsed.get("tool_name") or parsed.get("name"):
-        arguments = parsed.get("arguments")
-        if not isinstance(arguments, dict):
-            raise ValueError("tool_call.arguments must be an object")
-        return {
-            "type": "tool_call",
-            "tool_name": str(parsed.get("tool_name") or parsed.get("name")),
-            "arguments": arguments,
+def build_official_tool_schemas(allowed_tool_names, strict=False):
+    definitions = {
+        "repo_list_files": {
+            "name": "repo_list_files",
+            "description": "List files under an approved directory.",
+            "properties": {
+                "directory": {
+                    "type": "string",
+                    "description": "Approved directory, for example '.' or 'src'.",
+                }
+            },
+            "required": ["directory"],
+        },
+        "repo_read_file": {
+            "name": "repo_read_file",
+            "description": "Read one approved file.",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Approved file path.",
+                }
+            },
+            "required": ["path"],
+        },
+        "repo_search_text": {
+            "name": "repo_search_text",
+            "description": "Search approved files for exact text.",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Exact text to search for.",
+                }
+            },
+            "required": ["query"],
+        },
+        "repo_apply_patch": {
+            "name": "repo_apply_patch",
+            "description": "Request applying a unified diff patch to approved writable files. Runtime must preview and wait for user approval before applying.",
+            "properties": {
+                "patch": {
+                    "type": "string",
+                    "description": "Unified diff patch.",
+                }
+            },
+            "required": ["patch"],
+        },
+        "repo_write_file": {
+            "name": "repo_write_file",
+            "description": "Create a new approved file, or rewrite one file only when explicitly approved.",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Approved file path.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "File content.",
+                },
+                "create_only": {
+                    "type": "boolean",
+                    "description": "If true, fail when the file already exists.",
+                },
+            },
+            "required": ["path", "content", "create_only"],
+        },
+        "repo_delete_file": {
+            "name": "repo_delete_file",
+            "description": "Delete an approved file only when delete is explicitly approved.",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Approved file path.",
+                }
+            },
+            "required": ["path"],
+        },
+    }
+    schemas = []
+    for tool_name in allowed_tool_names:
+        definition = definitions.get(tool_name)
+        if not definition:
+            continue
+        function_schema = {
+            "name": definition["name"],
+            "description": definition["description"],
+            "parameters": {
+                "type": "object",
+                "properties": copy.deepcopy(definition["properties"]),
+                "required": list(definition["required"]),
+                "additionalProperties": False,
+            },
         }
-    return {"type": "final", "content": str(parsed.get("content") or str(content or "").strip())}
+        if strict:
+            function_schema["strict"] = True
+        schemas.append({"type": "function", "function": function_schema})
+    return schemas
+
+
+def _hash_text(text):
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
+
+
+def _update_usage_totals(current, partial):
+    current = copy.deepcopy(current or {})
+    partial = partial or {}
+    for key in (
+        "prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+        "total_tokens",
+    ):
+        if partial.get(key) is not None:
+            current[key] = int(partial.get(key) or 0)
+    return current
+
+
+def _consume_streamed_chat_completion(
+    messages,
+    selected_mode,
+    max_tokens,
+    retry=None,
+    tools=None,
+    tool_choice=None,
+    response_format=None,
+    event_sink=None,
+    session_id=None,
+    task_id=None,
+    emit_reasoning=False,
+    emit_content=False,
+):
+    model_name = None
+    finish_reason = None
+    usage = {}
+    reasoning_chunks = []
+    content_chunks = []
+    tool_calls = {}
+    saw_stream_event = False
+    for item in stream_deepseek_chat_completion(
+        messages=messages,
+        mode=selected_mode,
+        max_tokens=max_tokens,
+        retry=retry,
+        tools=tools,
+        tool_choice=tool_choice,
+        response_format=response_format,
+        stream_options={"include_usage": True},
+    ):
+        saw_stream_event = True
+        event_type = item.get("type")
+        if event_type == "meta":
+            model_name = item.get("model") or model_name
+            continue
+        if event_type == "finish":
+            finish_reason = item.get("finish_reason")
+            continue
+        if event_type == "usage":
+            usage = _update_usage_totals(usage, item.get("usage"))
+            continue
+        if event_type == "reasoning_delta":
+            reasoning_chunks.append(str(item.get("text") or ""))
+            if emit_reasoning:
+                full_text = "".join(reasoning_chunks)
+                emit_event(
+                    event_sink,
+                    "reasoning.delta",
+                    step="reasoning",
+                    message=str(item.get("text") or ""),
+                    status="reasoning",
+                    route=build_route(selected_mode, model_name),
+                    data={"chars": len(full_text), "hash": _hash_text(full_text), "reasoning_tokens": usage.get("reasoning_tokens")},
+                    session_id=session_id,
+                    task_id=task_id,
+                )
+            continue
+        if event_type == "content_delta":
+            content_chunks.append(str(item.get("text") or ""))
+            if emit_content:
+                emit_event(
+                    event_sink,
+                    "assistant.delta",
+                    step="final",
+                    message=str(item.get("text") or ""),
+                    status="in_progress",
+                    route=build_route(selected_mode, model_name),
+                    session_id=session_id,
+                    task_id=task_id,
+                )
+            continue
+        if event_type == "tool_call_delta":
+            index = int(item.get("index") or 0)
+            accumulator = tool_calls.setdefault(index, {
+                "index": index,
+                "id": item.get("id"),
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            })
+            if item.get("id") and not accumulator.get("id"):
+                accumulator["id"] = item.get("id")
+            accumulator["function"]["name"] += str(item.get("name_delta") or "")
+            accumulator["function"]["arguments"] += str(item.get("arguments_delta") or "")
+            emit_event(
+                event_sink,
+                "tool.call.delta",
+                step="tool_call",
+                message="Streaming tool call delta received.",
+                status="tool_call",
+                route=build_route(selected_mode, model_name),
+                data={
+                    "index": index,
+                    "id": accumulator.get("id"),
+                    "name_delta": str(item.get("name_delta") or ""),
+                    "arguments_delta": str(item.get("arguments_delta") or ""),
+                },
+                session_id=session_id,
+                task_id=task_id,
+            )
+            continue
+    if not saw_stream_event:
+        fallback_result = invoke_deepseek_chat_completion(
+            messages=messages,
+            mode=selected_mode,
+            max_tokens=max_tokens,
+            retry=retry,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+        )
+        if emit_reasoning and fallback_result.get("reasoning_content"):
+            emit_event(
+                event_sink,
+                "reasoning.delta",
+                step="reasoning",
+                message=str(fallback_result.get("reasoning_content") or ""),
+                status="reasoning",
+                route=build_route(selected_mode, fallback_result.get("model")),
+                data={
+                    "chars": len(str(fallback_result.get("reasoning_content") or "")),
+                    "hash": _hash_text(str(fallback_result.get("reasoning_content") or "")),
+                    "reasoning_tokens": fallback_result.get("reasoning_tokens"),
+                },
+                session_id=session_id,
+                task_id=task_id,
+            )
+        if emit_content and fallback_result.get("content") and not looks_like_failed_tool_protocol(fallback_result.get("content")):
+            emit_event(
+                event_sink,
+                "assistant.delta",
+                step="final",
+                message=str(fallback_result.get("content") or ""),
+                status="in_progress",
+                route=build_route(selected_mode, fallback_result.get("model")),
+                session_id=session_id,
+                task_id=task_id,
+            )
+        return fallback_result
+    ordered_tool_calls = []
+    for index in sorted(tool_calls):
+        payload = tool_calls[index]
+        ordered_tool_calls.append({
+            "id": payload.get("id") or f"toolcall_{uuid4().hex}",
+            "type": "function",
+            "function": {
+                "name": payload["function"]["name"],
+                "arguments": payload["function"]["arguments"],
+            },
+        })
+    return {
+        "content": "".join(content_chunks),
+        "reasoning_content": "".join(reasoning_chunks),
+        "tool_calls": ordered_tool_calls,
+        "model": model_name or mode_to_model_spec(selected_mode)["model"],
+        "model_label": build_route(selected_mode, model_name).get("display_label"),
+        "finish_reason": finish_reason,
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "reasoning_tokens": usage.get("reasoning_tokens"),
+        "prompt_cache_hit_tokens": usage.get("prompt_cache_hit_tokens"),
+        "prompt_cache_miss_tokens": usage.get("prompt_cache_miss_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+        "raw_message": {
+            "content": "".join(content_chunks),
+            "reasoning_content": "".join(reasoning_chunks),
+            "tool_calls": ordered_tool_calls,
+        },
+    }
+
+
+def _accumulate_usage(accumulator, result):
+    accumulator = copy.deepcopy(accumulator or {})
+    for key in (
+        "prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+        "total_tokens",
+    ):
+        accumulator[key] = int(accumulator.get(key) or 0) + int(result.get(key) or 0)
+    return accumulator
+
+
+def run_text_turn(messages, selected_mode, max_tokens, retry=None, event_sink=None, session_id=None, task_id=None):
+    initial_route = build_route(selected_mode)
+    emit_event(
+        event_sink,
+        "response.created",
+        step="response",
+        message="Response created.",
+        status="created",
+        route=initial_route,
+        session_id=session_id,
+        task_id=task_id,
+    )
+    emit_event(
+        event_sink,
+        "response.in_progress",
+        step="response",
+        message="Response in progress.",
+        status="in_progress",
+        route=initial_route,
+        session_id=session_id,
+        task_id=task_id,
+    )
+    emit_event(
+        event_sink,
+        "route.selected",
+        step="routing",
+        message=f"Model: {initial_route['model_family']} | Thinking: {'ON' if initial_route['thinking_type'] == 'enabled' else 'OFF'}",
+        status="routing",
+        route=initial_route,
+        session_id=session_id,
+        task_id=task_id,
+    )
+    emit_event(
+        event_sink,
+        "request.sending",
+        step="reasoning",
+        message="Sending request to DeepSeek.",
+        status="reasoning",
+        route=initial_route,
+        session_id=session_id,
+        task_id=task_id,
+    )
+    emit_event(
+        event_sink,
+        "reasoning.started",
+        step="reasoning",
+        message="Thinking active.",
+        status="reasoning",
+        route=initial_route,
+        session_id=session_id,
+        task_id=task_id,
+    )
+    if event_sink:
+        result = _consume_streamed_chat_completion(
+            messages=messages,
+            selected_mode=selected_mode,
+            max_tokens=max_tokens,
+            retry=retry,
+            event_sink=event_sink,
+            session_id=session_id,
+            task_id=task_id,
+            emit_reasoning=True,
+            emit_content=True,
+        )
+    else:
+        result = invoke_deepseek_chat_completion(messages=messages, mode=selected_mode, max_tokens=max_tokens, retry=retry)
+    route = build_route(selected_mode, result.get("model"))
+    reasoning_content = str(result.get("reasoning_content") or "")
+    if reasoning_content and not event_sink:
+        emit_event(
+            event_sink,
+            "reasoning.delta",
+            step="reasoning",
+            message=reasoning_content,
+            status="reasoning",
+            route=route,
+            data={"chars": len(reasoning_content), "hash": _hash_text(reasoning_content), "reasoning_tokens": result.get("reasoning_tokens")},
+            session_id=session_id,
+            task_id=task_id,
+        )
+    content = str(result.get("content") or "")
+    if not event_sink:
+        emit_event(
+            event_sink,
+            "assistant.delta",
+            step="final",
+            message=content,
+            status="completed",
+            route=route,
+            session_id=session_id,
+            task_id=task_id,
+        )
+    emit_event(
+        event_sink,
+        "usage.updated",
+        step="final",
+        message="Usage updated.",
+        status="completed",
+        route=route,
+        data=usage_from_result(result),
+        session_id=session_id,
+        task_id=task_id,
+    )
+    emit_event(
+        event_sink,
+        "turn.completed",
+        step="final",
+        message="DeepSeek turn completed.",
+        status="completed",
+        route=route,
+        data={"usage": usage_from_result(result), "content": content},
+        session_id=session_id,
+        task_id=task_id,
+    )
+    emit_event(
+        event_sink,
+        "response.completed",
+        step="response",
+        message="Response completed.",
+        status="completed",
+        route=route,
+        data={"usage": usage_from_result(result)},
+        session_id=session_id,
+        task_id=task_id,
+    )
+    return {
+        "content": content,
+        "result": result,
+        "route": route,
+        "usage": usage_from_result(result),
+    }
+
+
+def run_native_tool_turn(
+    state,
+    task,
+    allowed_tool_names,
+    user_messages,
+    max_output_tokens,
+    selected_mode,
+    event_sink=None,
+    session_id=None,
+    response_id=None,
+    messages_override=None,
+    usage_override=None,
+    tool_steps_override=None,
+    start_step=0,
+    response_started=False,
+):
+    route = build_route(selected_mode)
+    task_id = task["task_id"]
+    if not response_started:
+        emit_event(event_sink, "response.created", step="response", message="Response created.", status="created", route=route, session_id=session_id, task_id=task_id)
+        emit_event(event_sink, "response.in_progress", step="response", message="Response in progress.", status="in_progress", route=route, session_id=session_id, task_id=task_id)
+    emit_event(
+        event_sink,
+        "route.selected",
+        step="routing",
+        message=f"Model: {route['model_family']} | Thinking: {'ON' if route['thinking_type'] == 'enabled' else 'OFF'}",
+        status="routing",
+        route=route,
+        session_id=session_id,
+        task_id=task_id,
+    )
+    if messages_override is None:
+        emit_event(
+            event_sink,
+            "approval.confirmed",
+            step="approval",
+            message="Execution scope approved for native repository tools.",
+            status="approved",
+            route=route,
+            data={
+                "summary": task.get("approval_scope", {}).get("summary"),
+                "allowed_paths": task.get("tool_policy", {}).get("allowed_paths"),
+                "allowed_tools": allowed_tool_names,
+            },
+            session_id=session_id,
+            task_id=task_id,
+        )
+    state.begin_native_tool_session(task)
+    messages = copy.deepcopy(messages_override) if messages_override is not None else build_native_tool_messages(task, user_messages, allowed_tool_names)
+    usage = copy.deepcopy(usage_override or {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "reasoning_tokens": 0,
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 0,
+        "total_tokens": 0,
+    })
+    tool_steps = copy.deepcopy(tool_steps_override or [])
+    retry_policy = state.config.get("runtime", {}).get("retry")
+    strict_tools = bool((state.config.get("tool_calling") or {}).get("strict"))
+    allow_json_fallback = bool((state.config.get("tool_calling") or {}).get("fallback_json_protocol", True))
+    tool_schemas = build_official_tool_schemas(allowed_tool_names, strict=strict_tools)
+    repair_attempts = 0
+    tool_protocol = "native"
+
+    try:
+        for step in range(int(start_step), task["tool_policy"]["max_tool_steps"]):
+            emit_event(event_sink, "step.started", step="reasoning", message=f"DeepSeek reasoning turn {step + 1} started.", status="reasoning", route=route, session_id=session_id, task_id=task_id)
+            emit_event(event_sink, "request.sending", step="reasoning", message="Sending request to DeepSeek.", status="reasoning", route=route, session_id=session_id, task_id=task_id)
+            emit_event(event_sink, "reasoning.started", step="reasoning", message="Thinking active.", status="reasoning", route=route, session_id=session_id, task_id=task_id)
+            if event_sink:
+                result = _consume_streamed_chat_completion(
+                    messages=messages,
+                    selected_mode=selected_mode,
+                    max_tokens=max_output_tokens,
+                    retry=retry_policy,
+                    tools=tool_schemas,
+                    tool_choice="auto",
+                    event_sink=event_sink,
+                    session_id=session_id,
+                    task_id=task_id,
+                    emit_reasoning=True,
+                    emit_content=True,
+                )
+            else:
+                result = invoke_deepseek_chat_completion(
+                    messages=messages,
+                    mode=selected_mode,
+                    max_tokens=max_output_tokens,
+                    retry=retry_policy,
+                    tools=tool_schemas,
+                    tool_choice="auto",
+                )
+            route = build_route(selected_mode, result.get("model"))
+            usage = _accumulate_usage(usage, result)
+            if result.get("reasoning_content") and not event_sink:
+                emit_event(
+                    event_sink,
+                    "reasoning.delta",
+                    step="reasoning",
+                    message=str(result.get("reasoning_content") or ""),
+                    status="reasoning",
+                    route=route,
+                    data={
+                        "chars": len(str(result.get("reasoning_content") or "")),
+                        "hash": _hash_text(str(result.get("reasoning_content") or "")),
+                        "reasoning_tokens": result.get("reasoning_tokens"),
+                    },
+                    session_id=session_id,
+                    task_id=task_id,
+                )
+            emit_event(
+                event_sink,
+                "usage.updated",
+                step="reasoning",
+                message="Usage updated.",
+                status="reasoning",
+                route=route,
+                data=usage_from_result(usage),
+                session_id=session_id,
+                task_id=task_id,
+            )
+
+            assistant_message = {"role": "assistant", "content": str(result.get("content") or "")}
+            if result.get("tool_calls"):
+                assistant_message["tool_calls"] = copy.deepcopy(result.get("tool_calls") or [])
+            if result.get("reasoning_content") and result.get("tool_calls"):
+                assistant_message["reasoning_content"] = str(result.get("reasoning_content") or "")
+
+            fallback_parsed = None
+            if not result.get("tool_calls"):
+                parsed_candidate = parse_tool_loop_response(result.get("content"))
+                if parsed_candidate["type"] == "tool_call":
+                    if not allow_json_fallback:
+                        raise TaskConflictError("Native tool call response missing official tool_calls")
+                    tool_protocol = "json_fallback"
+                    fallback_parsed = parsed_candidate
+                    emit_event(
+                        event_sink,
+                        "tool.protocol.fallback",
+                        step="tool_call",
+                        message="Falling back to legacy JSON tool protocol.",
+                        status="tool_protocol_fallback",
+                        route=route,
+                        session_id=session_id,
+                        task_id=task_id,
+                    )
+                elif parsed_candidate["type"] == "final" and is_invalid_final_response(result.get("content")):
+                    if repair_attempts >= 1:
+                        raise TaskConflictError("Model never produced a valid final response after protocol repair")
+                    repair_attempts += 1
+                    emit_event(
+                        event_sink,
+                        "tool.protocol.error",
+                        step="tool_call",
+                        message="Invalid tool protocol response, requesting repair.",
+                        status="tool_protocol_error",
+                        route=route,
+                        data={"attempt": repair_attempts},
+                        session_id=session_id,
+                        task_id=task_id,
+                    )
+                    messages.append({"role": "assistant", "content": str(result.get("content") or "")})
+                    messages.append({"role": "user", "content": repair_message("Return either official tool_calls or a clean final answer.")})
+                    continue
+                else:
+                    content = str(parsed_candidate["content"] or str(result.get("content") or ""))
+                    if not event_sink:
+                        emit_event(event_sink, "assistant.delta", step="final", message=content, status="completed", route=route, session_id=session_id, task_id=task_id)
+                    state.complete_native_tool_session(task, result | {"content": content, "route": route, "tool_protocol": tool_protocol}, usage, tool_steps)
+                    emit_event(event_sink, "turn.completed", step="final", message="Native tool execution completed.", status="completed", route=route, data={"usage": usage_from_result(usage), "content": content, "tool_steps": tool_steps}, session_id=session_id, task_id=task_id)
+                    emit_event(event_sink, "response.completed", step="response", message="Response completed.", status="completed", route=route, data={"usage": usage_from_result(usage)}, session_id=session_id, task_id=task_id)
+                    return {
+                        "status": "completed",
+                        "content": content,
+                        "result": result | {"tool_protocol": tool_protocol},
+                        "route": route,
+                        "usage": usage,
+                        "tool_steps": tool_steps,
+                    }
+
+            if fallback_parsed is not None:
+                tool_calls = [{
+                    "id": f"toolcall_{uuid4().hex}",
+                    "type": "function",
+                    "function": {
+                        "name": str(fallback_parsed.get("tool_name") or ""),
+                        "arguments": json.dumps(fallback_parsed.get("arguments") or {}, ensure_ascii=False),
+                    },
+                }]
+                assistant_message["tool_calls"] = copy.deepcopy(tool_calls)
+            else:
+                tool_calls = copy.deepcopy(result.get("tool_calls") or [])
+
+            messages.append(assistant_message)
+            retry_requested = False
+            for tool_call in tool_calls:
+                function_payload = tool_call.get("function") or {}
+                tool_name = str(function_payload.get("name") or "").strip()
+                try:
+                    arguments = json.loads(str(function_payload.get("arguments") or "{}"))
+                    if not isinstance(arguments, dict):
+                        raise ValueError("tool arguments must decode to an object")
+                except Exception as exc:
+                    if repair_attempts >= 1:
+                        raise TaskConflictError(f"Invalid tool arguments JSON for {tool_name}: {exc}")
+                    repair_attempts += 1
+                    emit_event(
+                        event_sink,
+                        "tool.protocol.error",
+                        step="tool_call",
+                        message=f"Invalid tool arguments for {tool_name}, requesting repair.",
+                        status="tool_protocol_error",
+                        route=route,
+                        data={"error": str(exc), "attempt": repair_attempts},
+                        session_id=session_id,
+                        task_id=task_id,
+                    )
+                    messages.append({"role": "user", "content": repair_message(f"{tool_name}.arguments must be valid JSON object text.")})
+                    retry_requested = True
+                    break
+                if tool_name not in allowed_tool_names:
+                    raise PolicyError(f"Tool is not allowed by response request: {tool_name}")
+                target = arguments.get("path") or arguments.get("directory") or arguments.get("query") or ""
+                emit_event(
+                    event_sink,
+                    "tool.call.started",
+                    step="tool_call",
+                    message=f"{tool_name} -> {target}",
+                    status="tool_call",
+                    route=route,
+                    data={"tool_name": tool_name, "target": target, "turn": step + 1},
+                    session_id=session_id,
+                    task_id=task_id,
+                )
+                if tool_name == "repo_apply_patch":
+                    patch_text = arguments.get("patch") or ""
+                    tool_steps.append({"step": step + 1, "tool_name": tool_name, "target": target, "tool_protocol": tool_protocol, "status": "requires_action"})
+                    append_log(state.log_path, {"kind": "tool_call", "task_id": task["task_id"], "tool_name": tool_name, "target": target, "step": step + 1, "error": ""})
+                    continuation = state.register_continuation(
+                        task=task,
+                        patch_id=None,
+                        messages=messages,
+                        selected_mode=selected_mode,
+                        allowed_tool_names=allowed_tool_names,
+                        max_output_tokens=max_output_tokens,
+                        tool_call_id=tool_call.get("id"),
+                        session_id=session_id,
+                        response_id=response_id,
+                        usage=usage,
+                        tool_steps=tool_steps,
+                        next_step=step + 1,
+                    )
+                    patch = state.create_pending_patch(task, patch_text, tool_call_id=tool_call.get("id"), continuation=continuation)
+                    continuation["patch_id"] = patch["patch_id"]
+                    patch["continuation_id"] = continuation["continuation_id"]
+                    state.save_task_store()
+                    emit_event(
+                        event_sink,
+                        "patch.preview",
+                        step="patch_preview",
+                        message="Patch preview generated.",
+                        status="patch_ready",
+                        route=route,
+                        data={"patch_id": patch["patch_id"], "patch_summary": copy.deepcopy(patch["summary"])},
+                        session_id=session_id,
+                        task_id=task_id,
+                    )
+                    emit_event(
+                        event_sink,
+                        "patch.approval.required",
+                        step="patch_preview",
+                        message="Patch approval required before apply.",
+                        status="requires_action",
+                        route=route,
+                        data={"patch_id": patch["patch_id"], "summary": copy.deepcopy(patch["summary"])},
+                        session_id=session_id,
+                        task_id=task_id,
+                    )
+                    emit_event(
+                        event_sink,
+                        "tool.call.completed",
+                        step="tool_call",
+                        message=f"{tool_name} waiting for approval.",
+                        status="requires_action",
+                        route=route,
+                        data={"tool_name": tool_name, "target": target, "result": {"status": "waiting_for_patch_approval", "patch_id": patch["patch_id"], "summary": copy.deepcopy(patch["summary"])}},
+                        session_id=session_id,
+                        task_id=task_id,
+                    )
+                    emit_event(
+                        event_sink,
+                        "response.requires_action",
+                        step="response",
+                        message="Response requires patch approval.",
+                        status="requires_action",
+                        route=route,
+                        data={"type": "patch_approval", "task_id": task["task_id"], "patch_id": patch["patch_id"], "summary": copy.deepcopy(patch["summary"])},
+                        session_id=session_id,
+                        task_id=task_id,
+                    )
+                    return {
+                        "status": "requires_action",
+                        "content": "",
+                        "result": result | {"tool_protocol": tool_protocol},
+                        "route": route,
+                        "usage": usage,
+                        "tool_steps": tool_steps,
+                        "required_action": {
+                            "type": "patch_approval",
+                            "task_id": task["task_id"],
+                            "patch_id": patch["patch_id"],
+                            "summary": copy.deepcopy(patch["summary"]),
+                        },
+                    }
+
+                tool_error = None
+                try:
+                    tool_result = state.execute_native_tool(task, tool_name, arguments)
+                except (FileNotFoundError, PolicyError, ValueError) as exc:
+                    tool_error = exc
+                    tool_result = {"error": str(exc), "error_category": classify_error(exc), "recoverable": True}
+                tool_step = {"step": step + 1, "tool_name": tool_name, "target": target, "tool_protocol": tool_protocol}
+                if tool_error is not None:
+                    tool_step["error"] = str(tool_error)
+                tool_steps.append(tool_step)
+                append_log(state.log_path, {"kind": "tool_call", "task_id": task["task_id"], "tool_name": tool_name, "target": target, "step": step + 1, "error": str(tool_error) if tool_error is not None else ""})
+                emit_event(
+                    event_sink,
+                    "tool.call.completed",
+                    step="tool_call",
+                    message=f"{tool_name} completed." if tool_error is None else f"{tool_name} failed: {tool_error}",
+                    status="tool_call" if tool_error is None else "tool_error",
+                    route=route,
+                    data={"tool_name": tool_name, "target": target, "result": tool_result, "turn": step + 1},
+                    session_id=session_id,
+                    task_id=task_id,
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.get("id"),
+                    "content": json.dumps({"tool_name": tool_name, "result": tool_result}, ensure_ascii=False),
+                })
+            if retry_requested:
+                continue
+        raise TaskConflictError("Native tool loop exceeded max_tool_steps")
+    except Exception as exc:
+        state.fail_native_tool_session(task, exc)
+        emit_event(
+            event_sink,
+            "turn.failed",
+            step="final",
+            message=str(exc),
+            status="failed",
+            route=route,
+            data={"error_category": classify_error(exc)},
+            session_id=session_id,
+            task_id=task_id,
+        )
+        raise
 
 
 def coerce_path_argument(arguments, key="path"):
@@ -545,15 +1516,19 @@ def coerce_path_argument(arguments, key="path"):
 
 
 class RuntimeState:
-    def __init__(self, project_root, log_path, port, user_config_path, task_store_path):
+    def __init__(self, project_root, log_path, port, user_config_path, task_store_path, session_store_path):
         self.project_root = Path(project_root).resolve()
         self.log_path = str(Path(log_path))
         self.port = port
         self.user_config_path = Path(user_config_path)
         self.task_store_path = Path(task_store_path)
+        self.session_store_path = Path(session_store_path)
         self.config = self.load_user_config()
         self.agent_index = build_agent_index(self.config)
         self.task_store = self.load_task_store()
+        self.sessions = self.load_session_store()
+        self.pending_continuations = {}
+        self.patches_dir = self.project_root / ".codex" / "runtime" / "patches"
 
     def load_user_config(self):
         if not self.user_config_path.exists():
@@ -571,11 +1546,41 @@ class RuntimeState:
             data = json.load(handle)
         if not isinstance(data, dict) or not isinstance(data.get("tasks"), list):
             raise RuntimeError(f"Invalid task store format: {self.task_store_path}")
+        for task in data["tasks"]:
+            if isinstance(task, dict):
+                task.setdefault("pending_patches", [])
         return data
 
     def save_task_store(self):
         self.task_store_path.parent.mkdir(parents=True, exist_ok=True)
         self.task_store_path.write_text(json.dumps(self.task_store, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def load_session_store(self):
+        if not self.session_store_path.exists():
+            self.session_store_path.parent.mkdir(parents=True, exist_ok=True)
+            self.session_store_path.write_text(json.dumps(DEFAULT_SESSION_STORE, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            return {}
+        with self.session_store_path.open("r", encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
+            raise RuntimeError(f"Invalid session store format: {self.session_store_path}")
+        return {session["session_id"]: session for session in data["sessions"] if isinstance(session, dict) and session.get("session_id")}
+
+    def save_session_store(self):
+        self.session_store_path.parent.mkdir(parents=True, exist_ok=True)
+        sessions = []
+        for session in self.sessions.values():
+            sanitized = copy.deepcopy(session)
+            sanitized["events"] = [sanitize_event_for_storage(event) for event in sanitized.get("events", [])]
+            if isinstance(sanitized.get("response"), dict):
+                sanitized["response"] = {
+                    "route": copy.deepcopy(sanitized["response"].get("route")),
+                    "usage": copy.deepcopy(sanitized["response"].get("usage")),
+                    "required_action": copy.deepcopy(sanitized["response"].get("required_action")),
+                }
+            sessions.append(sanitized)
+        payload = {"sessions": sessions}
+        self.session_store_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def find_task(self, task_id):
         for task in self.task_store["tasks"]:
@@ -584,6 +1589,7 @@ class RuntimeState:
         return None
 
     def health(self):
+        self.cleanup_pending_continuations()
         return {
             "ok": True,
             "service": "deepseek-scheduler",
@@ -591,10 +1597,300 @@ class RuntimeState:
             "project_root": str(self.project_root),
             "user_config_path": str(self.user_config_path),
             "task_store_path": str(self.task_store_path),
+            "session_store_path": str(self.session_store_path),
             "agents": len([agent for agent in self.config["connected_agents"] if agent.get("enabled", True)]),
             "tasks": len(self.task_store["tasks"]),
+            "sessions": len(self.sessions),
+            "pending_continuations": len(self.pending_continuations),
             "capabilities": runtime_capabilities(),
         }
+
+    def _now_epoch(self):
+        return int(time.time())
+
+    def _future_epoch(self, seconds):
+        return self._now_epoch() + int(seconds)
+
+    def _max_continuation_expiry(self, continuation):
+        created_at = int(continuation.get("created_epoch") or self._now_epoch())
+        return created_at + MAX_CONTINUATION_LIFETIME_SECONDS
+
+    def cleanup_pending_continuations(self):
+        now = self._now_epoch()
+        expired = []
+        for continuation_id, continuation in self.pending_continuations.items():
+            expires_at = int(continuation.get("expires_epoch") or 0)
+            max_expiry = self._max_continuation_expiry(continuation)
+            if expires_at <= now or max_expiry <= now:
+                expired.append(continuation_id)
+        for continuation_id in expired:
+            self.pending_continuations.pop(continuation_id, None)
+
+    def register_continuation(
+        self,
+        task,
+        patch_id,
+        messages,
+        selected_mode,
+        allowed_tool_names,
+        max_output_tokens,
+        tool_call_id,
+        session_id=None,
+        response_id=None,
+        usage=None,
+        tool_steps=None,
+        next_step=0,
+    ):
+        continuation_id = f"cont_{uuid4().hex}"
+        created_epoch = self._now_epoch()
+        continuation = {
+            "continuation_id": continuation_id,
+            "task_id": task["task_id"],
+            "patch_id": patch_id,
+            "messages": copy.deepcopy(messages),
+            "selected_mode": selected_mode,
+            "allowed_tool_names": list(allowed_tool_names),
+            "max_output_tokens": int(max_output_tokens),
+            "tool_call_id": tool_call_id,
+            "session_id": session_id,
+            "response_id": response_id,
+            "created_at": utc_now(),
+            "created_epoch": created_epoch,
+            "expires_at": utc_now(),
+            "expires_epoch": min(created_epoch + DEFAULT_CONTINUATION_TTL_SECONDS, created_epoch + MAX_CONTINUATION_LIFETIME_SECONDS),
+            "usage": copy.deepcopy(usage or {}),
+            "tool_steps": copy.deepcopy(tool_steps or []),
+            "next_step": int(next_step),
+        }
+        continuation["expires_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(continuation["expires_epoch"]))
+        self.pending_continuations[continuation_id] = continuation
+        return continuation
+
+    def get_continuation(self, continuation_id):
+        self.cleanup_pending_continuations()
+        continuation = self.pending_continuations.get(continuation_id)
+        if not continuation:
+            return None
+        now = self._now_epoch()
+        max_expiry = self._max_continuation_expiry(continuation)
+        continuation["expires_epoch"] = min(now + DEFAULT_CONTINUATION_TTL_SECONDS, max_expiry)
+        continuation["expires_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(continuation["expires_epoch"]))
+        return continuation
+
+    def clear_continuation(self, continuation_id):
+        self.pending_continuations.pop(continuation_id, None)
+
+    def create_session(self, payload):
+        session_id = str(payload.get("session_id") or f"session_{uuid4().hex}")
+        session = {
+            "session_id": session_id,
+            "status": "created",
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
+            "route": None,
+            "summary": {
+                "mode": payload.get("mode") or payload.get("execution_mode") or "text_delegate",
+                "has_tools": bool(payload.get("tools")),
+            },
+            "events": [],
+            "response": None,
+        }
+        self.sessions[session_id] = session
+        self.save_session_store()
+        return session
+
+    def get_session(self, session_id):
+        return self.sessions.get(session_id)
+
+    def append_session_event(self, session, event):
+        session["events"].append(event)
+        if event.get("route"):
+            session["route"] = event["route"]
+        session["updated_at"] = utc_now()
+        append_log(self.log_path, {
+            "kind": "session_event",
+            "session_id": session["session_id"],
+            "event": sanitize_event_for_storage(event),
+        })
+        self.save_session_store()
+
+    def _patch_path(self, patch_id):
+        return self.patches_dir / f"{patch_id}.patch"
+
+    def _write_patch_body(self, patch_id, patch_text):
+        self.patches_dir.mkdir(parents=True, exist_ok=True)
+        self._patch_path(patch_id).write_text(str(patch_text or ""), encoding="utf-8")
+
+    def _read_patch_body(self, patch_id):
+        path = self._patch_path(patch_id)
+        if not path.exists():
+            raise KeyError(patch_id)
+        return path.read_text(encoding="utf-8")
+
+    def _remove_patch_body(self, patch_id):
+        path = self._patch_path(patch_id)
+        if path.exists():
+            path.unlink()
+
+    def list_patches(self, task_id):
+        task = self.find_task(task_id)
+        if not task:
+            raise KeyError(task_id)
+        return copy.deepcopy(task.get("pending_patches") or [])
+
+    def find_pending_patch(self, task_id, patch_id):
+        task = self.find_task(task_id)
+        if not task:
+            raise KeyError(task_id)
+        for patch in task.get("pending_patches") or []:
+            if patch.get("patch_id") == patch_id:
+                return patch
+        raise KeyError(patch_id)
+
+    def create_pending_patch(self, task, patch_text, tool_call_id=None, continuation=None):
+        summary = summarize_patch(str(patch_text or ""))
+        patch_id = f"patch_{uuid4().hex}"
+        patch = {
+            "patch_id": patch_id,
+            "task_id": task["task_id"],
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
+            "status": "waiting",
+            "summary": {
+                "files": copy.deepcopy(summary.get("files") or []),
+                "additions": int(summary.get("additions") or 0),
+                "deletions": int(summary.get("deletions") or 0),
+                "sha256": summary.get("sha256"),
+            },
+            "tool_call_id": tool_call_id,
+            "continuation_id": continuation.get("continuation_id") if isinstance(continuation, dict) else None,
+            "approved_at": None,
+            "rejected_at": None,
+            "applied_at": None,
+        }
+        self._write_patch_body(patch_id, patch_text)
+        task.setdefault("pending_patches", []).append(patch)
+        task["status"] = "waiting_for_patch_approval"
+        task["timestamps"]["updated_at"] = utc_now()
+        self.save_task_store()
+        return patch
+
+    def approve_patch(self, task_id, patch_id, payload):
+        patch = self.find_pending_patch(task_id, patch_id)
+        if patch["status"] != "waiting":
+            raise TaskConflictError(f"Patch status does not allow approval: {patch['status']}")
+        patch["status"] = "approved"
+        patch["approved_at"] = utc_now()
+        patch["updated_at"] = utc_now()
+        patch["approval_note"] = str((payload or {}).get("approval_note") or "")
+        self.save_task_store()
+        return copy.deepcopy(patch)
+
+    def reject_patch(self, task_id, patch_id, payload):
+        patch = self.find_pending_patch(task_id, patch_id)
+        if patch["status"] in {"rejected", "applied"}:
+            raise TaskConflictError(f"Patch status does not allow rejection: {patch['status']}")
+        patch["status"] = "rejected"
+        patch["rejected_at"] = utc_now()
+        patch["updated_at"] = utc_now()
+        patch["rejection_note"] = str((payload or {}).get("rejection_note") or "")
+        task = self.find_task(task_id)
+        task["status"] = "failed"
+        task["timestamps"]["updated_at"] = utc_now()
+        self.clear_continuation(patch.get("continuation_id"))
+        self.save_task_store()
+        return copy.deepcopy(patch)
+
+    def apply_approved_patch(self, task, patch_id):
+        patch = self.find_pending_patch(task["task_id"], patch_id)
+        if patch["status"] != "approved":
+            raise TaskConflictError(f"Patch status does not allow apply: {patch['status']}")
+        continuation = self.get_continuation(patch.get("continuation_id"))
+        if not continuation:
+            raise TaskConflictError("pending_turn_context_missing")
+        patch_text = self._read_patch_body(patch_id)
+        summary = summarize_patch(patch_text)
+        if summary.get("sha256") != patch.get("summary", {}).get("sha256"):
+            raise TaskConflictError("patch sha256 mismatch")
+        self.apply_patch(patch_text, task["tool_policy"])
+        patch["status"] = "applied"
+        patch["applied_at"] = utc_now()
+        patch["updated_at"] = utc_now()
+        task["timestamps"]["updated_at"] = utc_now()
+        messages = copy.deepcopy(continuation["messages"])
+        messages.append({
+            "role": "tool",
+            "tool_call_id": patch.get("tool_call_id"),
+            "content": json.dumps(
+                {
+                    "status": "patch_applied",
+                    "patch_id": patch_id,
+                    "summary": copy.deepcopy(patch.get("summary") or {}),
+                },
+                ensure_ascii=False,
+            ),
+        })
+        session = self.get_session(continuation.get("session_id")) if continuation.get("session_id") else None
+
+        def session_sink(event):
+            if session:
+                self.append_session_event(session, event)
+
+        if session:
+            session_sink(make_event(
+                "patch.approval.confirmed",
+                step="patch_preview",
+                message="Patch approval confirmed.",
+                status="patch_approved",
+                data={"patch_id": patch_id, "summary": copy.deepcopy(patch.get("summary") or {})},
+                session_id=session["session_id"],
+                task_id=task["task_id"],
+            ))
+            session_sink(make_event(
+                "patch.applied",
+                step="patch_preview",
+                message="Patch applied.",
+                status="patch_applied",
+                data={"patch_id": patch_id, "summary": copy.deepcopy(patch.get("summary") or {})},
+                session_id=session["session_id"],
+                task_id=task["task_id"],
+            ))
+
+        try:
+            result = run_native_tool_turn(
+                self,
+                task,
+                continuation["allowed_tool_names"],
+                [],
+                continuation["max_output_tokens"],
+                continuation["selected_mode"],
+                event_sink=session_sink if session else None,
+                session_id=continuation.get("session_id"),
+                response_id=continuation.get("response_id"),
+                messages_override=messages,
+                usage_override=copy.deepcopy(continuation.get("usage") or {}),
+                tool_steps_override=copy.deepcopy(continuation.get("tool_steps") or []),
+                start_step=int(continuation.get("next_step") or 0),
+                response_started=True,
+            )
+            if session:
+                session["status"] = "requires_action" if result.get("status") == "requires_action" else "completed"
+                session["route"] = result.get("route")
+                session["response"] = {
+                    "content": result.get("content"),
+                    "usage": usage_from_result(result.get("usage") or {}),
+                    "route": result.get("route"),
+                    "required_action": copy.deepcopy(result.get("required_action")),
+                }
+                session["updated_at"] = utc_now()
+                self.save_session_store()
+            self.clear_continuation(continuation["continuation_id"])
+            self.save_task_store()
+            return result
+        except Exception:
+            self.clear_continuation(continuation["continuation_id"])
+            self.save_task_store()
+            raise
 
     def create_task(self, payload):
         task_type = str(payload.get("type") or "").strip()
@@ -641,6 +1937,7 @@ class RuntimeState:
             "parent_task_id": payload.get("parent_task_id"),
             "result": None,
             "usage": {},
+            "pending_patches": [],
             "timestamps": {
                 "created_at": utc_now(),
                 "updated_at": utc_now(),
@@ -748,20 +2045,22 @@ class RuntimeState:
         agent = self.agent_index[task["assigned_agent"]]
         mode = str((agent.get("defaults") or {}).get("mode") or "pro-thinking")
         try:
-            result = invoke_deepseek_chat(task, mode=mode)
+            turn = run_text_turn(
+                [{"role": "user", "content": build_task_prompt(task)}],
+                selected_mode=mode,
+                max_tokens=2048,
+                retry=self.config.get("runtime", {}).get("retry"),
+            )
+            result = turn["result"]
             task["result"] = {
-                "content": result["content"],
+                "content": turn["content"],
                 "model": result["model"],
                 "model_label": result["model_label"],
+                "route": turn["route"],
                 "finish_reason": result.get("finish_reason"),
                 "reasoning_content_discarded": True,
             }
-            task["usage"] = {
-                "prompt_tokens": result.get("prompt_tokens"),
-                "completion_tokens": result.get("completion_tokens"),
-                "reasoning_tokens": result.get("reasoning_tokens"),
-                "total_tokens": result.get("total_tokens"),
-            }
+            task["usage"] = turn["usage"]
             task["status"] = "success"
             task["timestamps"]["completed_at"] = utc_now()
             task["timestamps"]["updated_at"] = utc_now()
@@ -773,10 +2072,10 @@ class RuntimeState:
                 "assigned_agent": task["assigned_agent"],
                 "status": task["status"],
                 "execution_mode": task["execution_mode"],
-                "prompt_tokens": result.get("prompt_tokens"),
-                "completion_tokens": result.get("completion_tokens"),
-                "reasoning_tokens": result.get("reasoning_tokens"),
-                "total_tokens": result.get("total_tokens"),
+                "prompt_tokens": task["usage"].get("input_tokens"),
+                "completion_tokens": task["usage"].get("output_tokens"),
+                "reasoning_tokens": task["usage"].get("reasoning_tokens"),
+                "total_tokens": task["usage"].get("total_tokens"),
                 "model": result.get("model"),
                 "model_label": result.get("model_label"),
             })
@@ -814,7 +2113,7 @@ class RuntimeState:
             raise ValueError("scheduler_task_id is not configured for native tool execution")
         if not task.get("approval_scope", {}).get("approved"):
             raise PolicyError("Execution task has not been approved")
-        if task["status"] not in {"approved", "running", "success"}:
+        if task["status"] not in {"approved", "running", "success", "waiting_for_patch_approval"}:
             raise TaskConflictError(f"Task status does not allow native tool execution: {task['status']}")
         return task
 
@@ -854,7 +2153,9 @@ class RuntimeState:
             "content": result["content"],
             "model": result["model"],
             "model_label": result["model_label"],
+            "route": result.get("route"),
             "finish_reason": result.get("finish_reason"),
+            "tool_protocol": result.get("tool_protocol") or "native",
             "reasoning_content_discarded": True,
             "tool_steps": tool_steps,
         }
@@ -1142,21 +2443,19 @@ def apply_unified_patch_to_text(original_text, hunks):
 
 def build_native_tool_messages(task, user_messages, allowed_tool_names):
     tool_descriptions = {
-        "repo_list_files": "List files under an approved directory. Arguments: {\"directory\": \".\"}",
-        "repo_read_file": "Read one approved file. Arguments: {\"path\": \"src/app.py\"}",
-        "repo_search_text": "Search approved files for exact text. Arguments: {\"query\": \"needle\"}",
-        "repo_apply_patch": "Apply a unified diff patch to approved writable files. Arguments: {\"patch\": \"--- a/file\\n+++ b/file\\n@@ ...\"}",
-        "repo_write_file": "Create a new approved file, or rewrite one file only when explicitly approved. Arguments: {\"path\": \"notes.txt\", \"content\": \"...\", \"create_only\": true}",
-        "repo_delete_file": "Delete an approved file only when delete is explicitly approved. Arguments: {\"path\": \"old.txt\"}",
+        "repo_list_files": "List files under an approved directory.",
+        "repo_read_file": "Read one approved file.",
+        "repo_search_text": "Search approved files for exact text.",
+        "repo_apply_patch": "Request applying a unified diff patch to approved writable files. The runtime will preview it and require user approval before applying.",
+        "repo_write_file": "Create a new approved file, or rewrite one file only when explicitly approved. Always provide create_only=true unless full rewrite approval is explicit.",
+        "repo_delete_file": "Delete an approved file only when delete is explicitly approved.",
     }
     system_lines = [
         "You are the DeepSeek native repository worker.",
         "You must operate only through approved tools and approved paths.",
-        "Reply with JSON only.",
-        "When you need a tool, output:",
-        "{\"type\":\"tool_call\",\"tool_name\":\"repo_read_file\",\"arguments\":{\"path\":\"...\"}}",
-        "When you are done, output:",
-        "{\"type\":\"final\",\"content\":\"...\"}",
+        "Use the provided official function tools when needed.",
+        "Always provide all required tool arguments.",
+        "Do not invent tools. Do not request shell access.",
         "Never emit hidden reasoning. Never request shell access.",
         f"Task description: {task['description']}",
         f"Approved paths: {json.dumps(task['tool_policy']['allowed_paths'], ensure_ascii=False)}",
@@ -1225,6 +2524,42 @@ def build_handler(state):
                     "capabilities": runtime_capabilities(),
                 })
                 return
+            if self.path.startswith("/v1/sessions/") and self.path.endswith("/events"):
+                session_id = self.path.split("/v1/sessions/", 1)[1].rsplit("/events", 1)[0]
+                session = state.get_session(session_id)
+                if not session:
+                    raise KeyError(session_id)
+                write_sse_headers(self)
+                for event in session["events"]:
+                    write_sse_event(self, event)
+                return
+            if self.path.startswith("/v1/sessions/"):
+                session_id = self.path.split("/v1/sessions/", 1)[1]
+                session = state.get_session(session_id)
+                if not session:
+                    raise KeyError(session_id)
+                write_json(self, 200, {
+                    "session_id": session["session_id"],
+                    "status": session["status"],
+                    "created_at": session["created_at"],
+                    "updated_at": session["updated_at"],
+                    "route": session.get("route"),
+                    "summary": session.get("summary"),
+                    "event_count": len(session.get("events") or []),
+                    "response": session.get("response"),
+                })
+                return
+            if self.path.startswith("/v1/tasks/") and "/patches" in self.path:
+                relative = self.path.split("/v1/tasks/", 1)[1]
+                task_id, _, remainder = relative.partition("/patches")
+                if not remainder or remainder == "":
+                    write_json(self, 200, {"data": state.list_patches(task_id)})
+                    return
+                patch_id = remainder.strip("/").split("/", 1)[0]
+                patch = copy.deepcopy(state.find_pending_patch(task_id, patch_id))
+                patch["patch_text"] = state._read_patch_body(patch_id)
+                write_json(self, 200, patch)
+                return
             if self.path.startswith("/v1/tasks/"):
                 task_id = self.path.split("/v1/tasks/", 1)[1]
                 task = state.find_task(task_id)
@@ -1237,11 +2572,34 @@ def build_handler(state):
         def _do_post(self):
             if self.path == "/v1/responses":
                 return self.handle_responses()
+            if self.path == "/v1/sessions":
+                payload = self.read_payload()
+                return self.handle_session_create(payload)
             if self.path == "/v1/tasks":
                 payload = self.read_payload()
                 task = state.create_task(payload)
                 write_json(self, 201, task)
                 return
+            if self.path.startswith("/v1/tasks/") and "/patches/" in self.path:
+                relative = self.path.split("/v1/tasks/", 1)[1]
+                task_id, _, remainder = relative.partition("/patches/")
+                patch_id, _, action = remainder.partition("/")
+                payload = self.read_payload()
+                if action == "approve":
+                    patch = state.approve_patch(task_id, patch_id, payload)
+                    write_json(self, 200, patch)
+                    return
+                if action == "reject":
+                    patch = state.reject_patch(task_id, patch_id, payload)
+                    write_json(self, 200, patch)
+                    return
+                if action == "apply":
+                    task = state.find_task(task_id)
+                    if not task:
+                        raise KeyError(task_id)
+                    result = state.apply_approved_patch(task, patch_id)
+                    write_json(self, 200, result)
+                    return
             if self.path.endswith("/approve"):
                 task_id = self.path.rsplit("/", 2)[1]
                 task = state.approve_task(task_id, self.read_payload())
@@ -1267,39 +2625,46 @@ def build_handler(state):
 
             payload = self.read_payload()
             if payload.get("stream"):
-                write_json(self, 400, {
-                    "error": {
-                        "message": "This scheduler Responses endpoint does not implement stream=true. Use synchronous mode only."
-                    }
-                })
-                return
+                return self.handle_streaming_response(payload)
 
             if payload.get("tools"):
                 return self.handle_native_tools_response(payload)
             return self.handle_text_response(payload)
 
         def handle_text_response(self, payload):
-            model = str(payload.get("model") or os.environ.get("DEEPSEEK_OPENAI_MODEL") or "deepseek-v4-pro")
             messages = response_input_to_messages(payload.get("input"))
             if not messages:
                 messages = [{"role": "user", "content": "Respond with exactly: ok"}]
 
             effort = str((payload.get("metadata") or {}).get("deepseek_reasoning_effort") or os.environ.get("DEEPSEEK_THINKING_DEFAULT") or "disabled")
-            thinking_mode = "pro" if effort in {"disabled", "none", "low-cost"} else "pro-thinking"
-            result = invoke_deepseek_messages(messages, mode=thinking_mode, max_tokens=int(payload.get("max_output_tokens") or 512))
-            content = str(result.get("content") or "")
+            selected_mode = select_mode(
+                requested_mode=(payload.get("metadata") or {}).get("deepseek_mode"),
+                requested_model=payload.get("model"),
+                effort=effort,
+                default_mode="pro-thinking",
+            )
+            turn = run_text_turn(
+                messages,
+                selected_mode=selected_mode,
+                max_tokens=int(payload.get("max_output_tokens") or 512),
+                retry=state.config.get("runtime", {}).get("retry"),
+            )
+            result = turn["result"]
+            content = turn["content"]
             reasoning_content = str(result.get("reasoning_content") or "")
             append_log(state.log_path, {
                 "kind": "responses_usage",
                 "path": self.path,
-                "model": model,
+                "model": result.get("model"),
                 "model_label": result["model_label"],
-                "thinking_type": "disabled" if thinking_mode == "pro" else "enabled",
+                "thinking_type": turn["route"]["thinking_type"],
                 "request_input_chars": sum(len(m.get("content", "")) for m in messages),
                 "message_count": len(messages),
                 "prompt_tokens": result.get("prompt_tokens"),
                 "completion_tokens": result.get("completion_tokens"),
                 "reasoning_tokens": result.get("reasoning_tokens"),
+                "prompt_cache_hit_tokens": result.get("prompt_cache_hit_tokens"),
+                "prompt_cache_miss_tokens": result.get("prompt_cache_miss_tokens"),
                 "reasoning_chars_discarded": len(reasoning_content),
                 "total_tokens": result.get("total_tokens"),
                 "mode": "text_delegate",
@@ -1310,16 +2675,12 @@ def build_handler(state):
                 "created_at": int(time.time()),
                 "status": "completed",
                 "error": None,
-                "model": model,
+                "model": result.get("model"),
                 "model_label": result["model_label"],
+                "route": turn["route"],
                 "output": build_response_output(content),
                 "output_text": content,
-                "usage": {
-                    "input_tokens": result.get("prompt_tokens"),
-                    "output_tokens": result.get("completion_tokens"),
-                    "total_tokens": result.get("total_tokens"),
-                    "reasoning_tokens": result.get("reasoning_tokens"),
-                },
+                "usage": turn["usage"],
             }
             write_json(self, 200, response)
 
@@ -1330,86 +2691,204 @@ def build_handler(state):
             allowed_tool_names = state.allowed_tool_names_for_response(payload.get("tools"), task["tool_policy"])
             if "shell_command" in allowed_tool_names:
                 raise ValueError("shell_command is intentionally disabled in this runtime")
-
-            state.begin_native_tool_session(task)
-            model = str(payload.get("model") or os.environ.get("DEEPSEEK_OPENAI_MODEL") or "deepseek-v4-pro")
             user_messages = response_input_to_messages(payload.get("input"))
-            messages = build_native_tool_messages(task, user_messages, allowed_tool_names)
             agent = state.agent_index[task["assigned_agent"]]
-            mode = str((agent.get("defaults") or {}).get("mode") or "pro-thinking")
-            usage = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0}
-            tool_steps = []
+            agent_default_mode = str((agent.get("defaults") or {}).get("mode") or "pro-thinking")
+            selected_mode = metadata.get("deepseek_mode") or agent_default_mode
+            turn = run_native_tool_turn(
+                state,
+                task,
+                allowed_tool_names,
+                user_messages,
+                int(payload.get("max_output_tokens") or 1024),
+                selected_mode,
+            )
+            append_log(state.log_path, {
+                "kind": "responses_usage",
+                "path": self.path,
+                "model": turn["result"].get("model"),
+                "model_label": turn["result"]["model_label"],
+                "thinking_type": turn["route"]["thinking_type"],
+                "prompt_tokens": turn["usage"].get("prompt_tokens"),
+                "completion_tokens": turn["usage"].get("completion_tokens"),
+                "reasoning_tokens": turn["usage"].get("reasoning_tokens"),
+                "prompt_cache_hit_tokens": turn["usage"].get("prompt_cache_hit_tokens"),
+                "prompt_cache_miss_tokens": turn["usage"].get("prompt_cache_miss_tokens"),
+                "total_tokens": turn["usage"].get("total_tokens"),
+                "mode": "native_tools",
+                "task_id": task["task_id"],
+                "tool_step_count": len(turn["tool_steps"]),
+                "tool_protocol": (turn.get("result") or {}).get("tool_protocol") or "native",
+            })
+            if turn.get("status") == "requires_action":
+                write_json(self, 200, {
+                    "id": f"resp_{uuid4().hex}",
+                    "object": "response",
+                    "created_at": int(time.time()),
+                    "status": "requires_action",
+                    "error": None,
+                    "model": turn["result"].get("model"),
+                    "model_label": turn["result"]["model_label"],
+                    "route": turn["route"],
+                    "output": [],
+                    "output_text": "",
+                    "usage": usage_from_result(turn["usage"]),
+                    "required_action": copy.deepcopy(turn.get("required_action")),
+                })
+                return
+            response = {
+                "id": f"resp_{uuid4().hex}",
+                "object": "response",
+                "created_at": int(time.time()),
+                "status": "completed",
+                "error": None,
+                "model": turn["result"].get("model"),
+                "model_label": turn["result"]["model_label"],
+                "route": turn["route"],
+                "output": build_response_output(turn["content"]),
+                "output_text": turn["content"],
+                "usage": usage_from_result(turn["usage"]),
+                "required_action": None,
+            }
+            write_json(self, 200, response)
+
+        def handle_streaming_response(self, payload):
+            events = []
+
+            def event_sink(event):
+                events.append(event)
+                write_sse_event(self, event)
+
+            write_sse_headers(self)
+            try:
+                if payload.get("tools"):
+                    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+                    task = state.require_task_for_native_tools(metadata.get("scheduler_task_id"))
+                    allowed_tool_names = state.allowed_tool_names_for_response(payload.get("tools"), task["tool_policy"])
+                    agent = state.agent_index[task["assigned_agent"]]
+                    agent_default_mode = str((agent.get("defaults") or {}).get("mode") or "pro-thinking")
+                    selected_mode = metadata.get("deepseek_mode") or agent_default_mode
+                    turn = run_native_tool_turn(
+                        state,
+                        task,
+                        allowed_tool_names,
+                        response_input_to_messages(payload.get("input")),
+                        int(payload.get("max_output_tokens") or 1024),
+                        selected_mode,
+                        event_sink=event_sink,
+                    )
+                else:
+                    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+                    selected_mode = select_mode(
+                        requested_mode=metadata.get("deepseek_mode"),
+                        requested_model=payload.get("model"),
+                        effort=metadata.get("deepseek_reasoning_effort") or os.environ.get("DEEPSEEK_THINKING_DEFAULT") or "disabled",
+                        default_mode="pro-thinking",
+                    )
+                    turn = run_text_turn(
+                        response_input_to_messages(payload.get("input")) or [{"role": "user", "content": "Respond with exactly: ok"}],
+                        selected_mode=selected_mode,
+                        max_tokens=int(payload.get("max_output_tokens") or 512),
+                        retry=state.config.get("runtime", {}).get("retry"),
+                        event_sink=event_sink,
+                    )
+                self.close_connection = True
+                return turn
+            except Exception as exc:
+                write_sse_event(self, make_event(
+                    "turn.failed",
+                    step="final",
+                    message=str(exc),
+                    status="failed",
+                    data={"error_category": classify_error(exc)},
+                ))
+                self.close_connection = True
+
+        def handle_session_create(self, payload):
+            session = state.create_session(payload)
+
+            def event_sink(event):
+                state.append_session_event(session, event)
+
+            state.append_session_event(session, make_event(
+                "session.started",
+                step="session",
+                message="Session started.",
+                status="created",
+                session_id=session["session_id"],
+            ))
 
             try:
-                for step in range(task["tool_policy"]["max_tool_steps"]):
-                    result = invoke_deepseek_messages(messages, mode=mode, max_tokens=int(payload.get("max_output_tokens") or 1024))
-                    usage["prompt_tokens"] += int(result.get("prompt_tokens") or 0)
-                    usage["completion_tokens"] += int(result.get("completion_tokens") or 0)
-                    usage["reasoning_tokens"] += int(result.get("reasoning_tokens") or 0)
-                    usage["total_tokens"] += int(result.get("total_tokens") or 0)
-
-                    parsed = parse_tool_loop_response(result.get("content"))
-                    if parsed["type"] == "final":
-                        append_log(state.log_path, {
-                            "kind": "responses_usage",
-                            "path": self.path,
-                            "model": model,
-                            "model_label": result["model_label"],
-                            "thinking_type": "enabled" if "thinking" in result["model_label"] else "disabled",
-                            "prompt_tokens": usage["prompt_tokens"],
-                            "completion_tokens": usage["completion_tokens"],
-                            "reasoning_tokens": usage["reasoning_tokens"],
-                            "total_tokens": usage["total_tokens"],
-                            "mode": "native_tools",
-                            "task_id": task["task_id"],
-                            "tool_step_count": len(tool_steps),
-                        })
-                        state.complete_native_tool_session(task, result | {"content": parsed["content"]}, usage, tool_steps)
-                        response = {
-                            "id": f"resp_{uuid4().hex}",
-                            "object": "response",
-                            "created_at": int(time.time()),
-                            "status": "completed",
-                            "error": None,
-                            "model": model,
-                            "model_label": result["model_label"],
-                            "output": build_response_output(parsed["content"]),
-                            "output_text": parsed["content"],
-                            "usage": {
-                                "input_tokens": usage["prompt_tokens"],
-                                "output_tokens": usage["completion_tokens"],
-                                "total_tokens": usage["total_tokens"],
-                                "reasoning_tokens": usage["reasoning_tokens"],
-                            },
-                        }
-                        write_json(self, 200, response)
-                        return
-
-                    tool_name = parsed["tool_name"]
-                    if tool_name not in allowed_tool_names:
-                        raise PolicyError(f"Tool is not allowed by response request: {tool_name}")
-                    tool_result = state.execute_native_tool(task, tool_name, parsed["arguments"])
-                    step_summary = {
-                        "step": step + 1,
-                        "tool_name": tool_name,
-                        "target": parsed["arguments"].get("path") or parsed["arguments"].get("directory") or parsed["arguments"].get("query") or "",
-                    }
-                    tool_steps.append(step_summary)
-                    append_log(state.log_path, {
-                        "kind": "tool_call",
-                        "task_id": task["task_id"],
-                        "tool_name": tool_name,
-                        "target": step_summary["target"],
-                        "step": step + 1,
-                    })
-                    messages.append({"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False)})
-                    messages.append({
-                        "role": "user",
-                        "content": "Tool result:\n" + json.dumps({"tool_name": tool_name, "result": tool_result}, ensure_ascii=False, indent=2),
-                    })
-                raise TaskConflictError("Native tool loop exceeded max_tool_steps")
+                if payload.get("tools"):
+                    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+                    task = state.require_task_for_native_tools(metadata.get("scheduler_task_id"))
+                    allowed_tool_names = state.allowed_tool_names_for_response(payload.get("tools"), task["tool_policy"])
+                    agent = state.agent_index[task["assigned_agent"]]
+                    agent_default_mode = str((agent.get("defaults") or {}).get("mode") or "pro-thinking")
+                    selected_mode = metadata.get("deepseek_mode") or agent_default_mode
+                    turn = run_native_tool_turn(
+                        state,
+                        task,
+                        allowed_tool_names,
+                        response_input_to_messages(payload.get("input")),
+                        int(payload.get("max_output_tokens") or 1024),
+                        selected_mode,
+                        event_sink=event_sink,
+                        session_id=session["session_id"],
+                    )
+                else:
+                    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+                    selected_mode = select_mode(
+                        requested_mode=metadata.get("deepseek_mode"),
+                        requested_model=payload.get("model"),
+                        effort=metadata.get("deepseek_reasoning_effort") or os.environ.get("DEEPSEEK_THINKING_DEFAULT") or "disabled",
+                        default_mode="pro-thinking",
+                    )
+                    turn = run_text_turn(
+                        response_input_to_messages(payload.get("input")) or [{"role": "user", "content": "Respond with exactly: ok"}],
+                        selected_mode=selected_mode,
+                        max_tokens=int(payload.get("max_output_tokens") or 512),
+                        retry=state.config.get("runtime", {}).get("retry"),
+                        event_sink=event_sink,
+                        session_id=session["session_id"],
+                    )
+                session["status"] = "requires_action" if turn.get("status") == "requires_action" else "completed"
+                session["route"] = turn["route"]
+                session["response"] = {
+                    "content": turn.get("content"),
+                    "usage": usage_from_result(turn["usage"]),
+                    "route": turn["route"],
+                    "required_action": copy.deepcopy(turn.get("required_action")),
+                }
+                session["updated_at"] = utc_now()
+                state.append_session_event(session, make_event(
+                    "session.completed" if session["status"] == "completed" else "response.requires_action",
+                    step="session",
+                    message="Session completed." if session["status"] == "completed" else "Session requires patch approval.",
+                    status=session["status"],
+                    route=turn["route"],
+                    session_id=session["session_id"],
+                    task_id=task["task_id"] if payload.get("tools") else None,
+                ))
+                state.save_session_store()
+                write_json(self, 201, {
+                    "session_id": session["session_id"],
+                    "status": session["status"],
+                    "route": session["route"],
+                    "event_count": len(session["events"]),
+                    "response": session["response"],
+                })
             except Exception as exc:
-                state.fail_native_tool_session(task, exc)
+                session["status"] = "failed"
+                session["updated_at"] = utc_now()
+                state.append_session_event(session, make_event(
+                    "turn.failed",
+                    step="final",
+                    message=str(exc),
+                    status="failed",
+                    data={"error_category": classify_error(exc)},
+                ))
+                state.save_session_store()
                 raise
 
     return Handler
@@ -1418,12 +2897,13 @@ def build_handler(state):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--log-path", default=".codex/deepseek-proxy.log.jsonl")
+    parser.add_argument("--log-path", default=".codex/runtime/events.log.jsonl")
     parser.add_argument("--stdout-log", default="")
     parser.add_argument("--stderr-log", default="")
     parser.add_argument("--project-root", default=".")
     parser.add_argument("--user-config", default="user_config.json")
     parser.add_argument("--task-store", default=".codex/runtime/task_queue.json")
+    parser.add_argument("--session-store", default=".codex/runtime/sessions.json")
     args = parser.parse_args()
 
     project_root = Path(args.project_root).resolve()
@@ -1442,6 +2922,7 @@ def main():
         port=args.port,
         user_config_path=(project_root / args.user_config),
         task_store_path=(project_root / args.task_store),
+        session_store_path=(project_root / args.session_store),
     )
     server = ThreadingHTTPServer(("127.0.0.1", args.port), build_handler(state))
     print(f"DeepSeek scheduler listening on http://127.0.0.1:{args.port}/")
@@ -1452,4 +2933,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
